@@ -79,6 +79,7 @@ func NewDockerService(i DockerServiceInput) (*DockerService, error) {
 	err = service.sync()
 
 	if err != nil {
+		_ = cli.Close()
 		return nil, fmt.Errorf("failed to do initial sync: %w", err)
 	}
 
