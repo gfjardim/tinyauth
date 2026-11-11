@@ -114,12 +114,22 @@ func NewLdapService(i LdapServiceInput) (*LdapService, error) {
 				}
 			case <-ctx.Done():
 				ldap.log.App.Debug().Msg("LDAP service context cancelled, stopping heartbeat")
+				ldap.close()
 				return
 			}
 		}
 	}, ding.RingMajor)
 
 	return ldap, nil
+}
+
+func (ldap *LdapService) close() {
+	ldap.mutex.Lock()
+	defer ldap.mutex.Unlock()
+
+	if ldap.conn != nil {
+		ldap.conn.Close()
+	}
 }
 
 func (ldap *LdapService) connect() (*ldapgo.Conn, error) {
