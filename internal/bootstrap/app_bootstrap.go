@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,14 +43,17 @@ type Services struct {
 }
 
 type BootstrapApp struct {
-	config   model.Config
-	log      *logger.Logger
-	ctx      context.Context
-	cancel   context.CancelFunc
-	queries  repository.Store
-	db       *sql.DB
-	ding     *ding.Ding
+	config  model.Config
+	log     *logger.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
+	queries repository.Store
+	db      *sql.DB
+	ding    *ding.Ding
+
+	// instance serving the requests, guarded by mu
 	instance *instance
+	mu       sync.RWMutex
 }
 
 func NewBootstrapApp(config model.Config) *BootstrapApp {
@@ -104,12 +108,12 @@ func (app *BootstrapApp) Setup() error {
 		return err
 	}
 
-	app.instance = inst
+	app.setInstance(inst)
 
 	app.ding.Go(func(ctx context.Context) {
 		<-ctx.Done()
 		app.log.App.Debug().Msg("Shutting down services")
-		app.instance.shutdown()
+		app.currentInstance().shutdown()
 	}, ding.RingMajor)
 
 	// start db cleanup routine
@@ -151,6 +155,35 @@ func (app *BootstrapApp) Setup() error {
 	}
 }
 
+func (app *BootstrapApp) currentInstance() *instance {
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+	return app.instance
+}
+
+// setInstance makes the given instance serve the requests and returns the previous one
+func (app *BootstrapApp) setInstance(inst *instance) *instance {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	previous := app.instance
+	app.instance = inst
+	return previous
+}
+
+// ServeHTTP hands the request to the current instance
+func (app *BootstrapApp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// count the request while holding the lock, so an instance that has been
+	// replaced never gets a new request
+	app.mu.RLock()
+	inst := app.instance
+	inst.requests.Add(1)
+	app.mu.RUnlock()
+
+	defer inst.requests.Done()
+
+	inst.router.ServeHTTP(w, r)
+}
+
 func (app *BootstrapApp) heartbeatRoutine(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(12) * time.Hour)
 	defer ticker.Stop()
@@ -162,7 +195,7 @@ func (app *BootstrapApp) heartbeatRoutine(ctx context.Context) {
 
 	var body Heartbeat
 
-	body.UUID = app.instance.runtime.UUID
+	body.UUID = app.currentInstance().runtime.UUID
 	body.Version = model.Version
 
 	bodyJson, err := json.Marshal(body)

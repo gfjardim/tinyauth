@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/steveiliop56/ding"
@@ -32,6 +33,9 @@ type instance struct {
 	router   *gin.Engine
 	ding     *ding.Ding
 	dig      *dig.Container
+
+	// requests being served by this instance
+	requests sync.WaitGroup
 }
 
 func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {

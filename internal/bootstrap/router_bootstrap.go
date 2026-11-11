@@ -159,7 +159,7 @@ func (app *BootstrapApp) serveHTTP(ctx context.Context) error {
 
 	server := &http.Server{
 		Addr:    address,
-		Handler: app.instance.router.Handler(),
+		Handler: app,
 	}
 
 	return app.serve(listener, server, ctx, "http")
@@ -186,7 +186,7 @@ func (app *BootstrapApp) serveUnix(ctx context.Context) error {
 	}
 
 	server := &http.Server{
-		Handler: app.instance.router.Handler(),
+		Handler: app,
 	}
 
 	return app.serve(listener, server, ctx, "unix socket")
