@@ -172,6 +172,11 @@ func (app *instance) setup() error {
 		return fmt.Errorf("failed to setup routes: %w", err)
 	}
 
+	// nothing can fail from here on, so it is safe to change stored data
+	if app.services.oidcService != nil {
+		app.services.oidcService.ReconcileConsents(app.ctx)
+	}
+
 	return nil
 }
 
