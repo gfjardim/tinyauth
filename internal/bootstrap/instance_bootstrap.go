@@ -70,6 +70,10 @@ func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
 	return inst, nil
 }
 
+func (app *instance) hasLabelProvider() bool {
+	return app.services.dockerService != nil || app.services.kubernetesService != nil
+}
+
 // shutdown stops the routines of the instance and waits for them to finish
 func (app *instance) shutdown() {
 	app.cancel()
