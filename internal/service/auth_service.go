@@ -568,10 +568,10 @@ func (auth *AuthService) GetOAuthURL(sessionId string) (string, error) {
 }
 
 func (auth *AuthService) GetOAuthToken(sessionId string, code string) (*oauth2.Token, error) {
-	session, ok := auth.caches.oauth.Get(sessionId)
+	session, err := auth.GetOAuthPendingSession(sessionId)
 
-	if !ok {
-		return nil, fmt.Errorf("oauth session not found: %s", sessionId)
+	if err != nil {
+		return nil, err
 	}
 
 	token, err := session.Service.GetToken(code, session.Verifier)
@@ -583,7 +583,7 @@ func (auth *AuthService) GetOAuthToken(sessionId string, code string) (*oauth2.T
 	session.Token = token
 
 	// ttl 0 means keep current expiration
-	ok = auth.caches.oauth.Update(sessionId, session, 0)
+	ok := auth.caches.oauth.Update(sessionId, *session, 0)
 
 	if !ok {
 		return nil, fmt.Errorf("failed to update oauth session with token: %s", sessionId)
@@ -632,6 +632,16 @@ func (auth *AuthService) GetOAuthPendingSession(sessionId string) (*OAuthPending
 	if !exists {
 		return &OAuthPendingSession{}, fmt.Errorf("oauth session not found: %s", sessionId)
 	}
+
+	// Always use the service from the broker, the one the session was
+	// created with may belong to a previous configuration
+	service, exists := auth.oauthBroker.GetService(session.Service.ID())
+
+	if !exists {
+		return &OAuthPendingSession{}, fmt.Errorf("oauth service no longer configured: %s", session.Service.ID())
+	}
+
+	session.Service = service
 
 	return &session, nil
 }
