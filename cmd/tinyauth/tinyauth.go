@@ -30,7 +30,7 @@ func main() {
 		Description:   "The simplest way to protect your apps with a login screen",
 		Configuration: tConfig,
 		Resources:     loaders,
-		Run: func(_ []string) error {
+		Run: func(args []string) error {
 			colors := getColors()
 			res := tConfig.Validate()
 			if len(res.Errors) > 0 {
@@ -39,7 +39,9 @@ func main() {
 			for _, warn := range res.Warnings {
 				fmt.Println(colors.yellow.Render("⚠") + " " + warn)
 			}
-			return runCmd(*tConfig)
+			return runCmd(*tConfig, func() (model.Config, error) {
+				return loadConfig(args, loaders)
+			})
 		},
 	}
 
@@ -170,8 +172,8 @@ func loadConfig(args []string, resources []cli.ResourceLoader) (model.Config, er
 	return *cfg, nil
 }
 
-func runCmd(cfg model.Config) error {
-	app := bootstrap.NewBootstrapApp(cfg)
+func runCmd(cfg model.Config, configLoader func() (model.Config, error)) error {
+	app := bootstrap.NewBootstrapApp(cfg).WithConfigLoader(configLoader)
 
 	err := app.Setup()
 

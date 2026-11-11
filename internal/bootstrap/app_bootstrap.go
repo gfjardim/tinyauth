@@ -58,12 +58,22 @@ type BootstrapApp struct {
 	// instance serving the requests, guarded by mu
 	instance *instance
 	mu       sync.RWMutex
+
+	// loads the configuration again from its sources, nil disables reloading
+	configLoader func() (model.Config, error)
 }
 
 func NewBootstrapApp(config model.Config) *BootstrapApp {
 	return &BootstrapApp{
 		config: config,
 	}
+}
+
+// WithConfigLoader enables reloading on SIGHUP, with the configuration
+// returned by the given loader
+func (app *BootstrapApp) WithConfigLoader(loader func() (model.Config, error)) *BootstrapApp {
+	app.configLoader = loader
+	return app
 }
 
 func (app *BootstrapApp) Setup() error {
@@ -134,6 +144,17 @@ func (app *BootstrapApp) Setup() error {
 		app.ding.Go(app.heartbeatRoutine, ding.RingMinor)
 	}
 
+	// reload the configuration on SIGHUP
+	if app.configLoader != nil {
+		sighup := make(chan os.Signal, 1)
+		signal.Notify(sighup, syscall.SIGHUP)
+
+		app.ding.Go(func(ctx context.Context) {
+			defer signal.Stop(sighup)
+			app.reloadRoutine(ctx, sighup)
+		}, ding.RingMinor)
+	}
+
 	// get listener
 	listenerFunc, err := app.getListenerFunc()
 
@@ -190,6 +211,67 @@ func (app *BootstrapApp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer inst.requests.Done()
 
 	inst.router.ServeHTTP(w, r)
+}
+
+// reload builds a new instance from the configuration returned by the loader
+// and makes it serve the requests. If the configuration cannot be loaded or
+// the instance cannot be built, the current instance is left untouched.
+func (app *BootstrapApp) reload() error {
+	config, err := app.configLoader()
+
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+
+	inst, err := app.newInstance(config)
+
+	if err != nil {
+		return fmt.Errorf("failed to apply configuration: %w", err)
+	}
+
+	app.retire(app.setInstance(inst))
+
+	return nil
+}
+
+// retire shuts an instance down once it has served the requests it already had
+func (app *BootstrapApp) retire(inst *instance) {
+	app.ding.Go(func(ctx context.Context) {
+		served := make(chan struct{})
+
+		go func() {
+			inst.requests.Wait()
+			close(served)
+		}()
+
+		select {
+		case <-served:
+		case <-time.After(model.GracefulShutdownTimeout * time.Second):
+			app.log.App.Warn().Msg("Previous configuration is still serving requests, shutting its services down anyway")
+		case <-ctx.Done():
+		}
+
+		inst.shutdown()
+	}, ding.RingMajor)
+}
+
+func (app *BootstrapApp) reloadRoutine(ctx context.Context, sighup <-chan os.Signal) {
+	for {
+		select {
+		case <-sighup:
+			app.log.App.Info().Msg("Received SIGHUP, reloading configuration")
+
+			if err := app.reload(); err != nil {
+				app.log.App.Error().Err(err).Msg("Failed to reload configuration, keeping the previous one")
+				continue
+			}
+
+			app.log.App.Info().Msg("Configuration reloaded")
+		case <-ctx.Done():
+			app.log.App.Debug().Msg("Stopping configuration reload routine")
+			return
+		}
+	}
 }
 
 func (app *BootstrapApp) heartbeatRoutine(ctx context.Context) {
