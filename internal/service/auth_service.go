@@ -137,7 +137,11 @@ func NewAuthService(i AuthServiceInput) (*AuthService, error) {
 		caches = NewAuthCaches()
 	}
 
-	caches.Login.SetMaxSize(service.calculateLockdownLimit())
+	// Only grow a cache that is already in use, the service may still be
+	// discarded and shrinking evicts entries. The routine below adjusts it later.
+	if limit := service.calculateLockdownLimit(); limit > caches.Login.GetMaxSize() {
+		caches.Login.SetMaxSize(limit)
+	}
 	ldapCache := cache.NewCacheStore[[]string](1024)
 
 	service.caches.oauth = caches.OAuth
