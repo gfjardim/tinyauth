@@ -27,6 +27,7 @@ type instance struct {
 	services Services
 	log      *logger.Logger
 	ctx      context.Context
+	cancel   context.CancelFunc
 	queries  repository.Store
 	router   *gin.Engine
 	ding     *ding.Ding
@@ -34,22 +35,34 @@ type instance struct {
 }
 
 func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
+	// the instance does not follow the app context, the app shuts it down
+	// once the listener has stopped
+	ctx, cancel := context.WithCancel(context.WithoutCancel(app.ctx))
+
 	inst := &instance{
 		config:  config,
 		log:     app.log,
-		ctx:     app.ctx,
+		ctx:     ctx,
+		cancel:  cancel,
 		queries: app.queries,
-		ding:    app.ding,
+		ding:    ding.New(ctx),
 		dig:     dig.New(),
 	}
 
 	err := inst.setup()
 
 	if err != nil {
+		inst.shutdown()
 		return nil, err
 	}
 
 	return inst, nil
+}
+
+// shutdown stops the routines of the instance and waits for them to finish
+func (app *instance) shutdown() {
+	app.cancel()
+	app.ding.Wait()
 }
 
 func (app *instance) setup() error {
