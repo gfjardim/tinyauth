@@ -150,6 +150,58 @@ func TestReload(t *testing.T) {
 		assert.NoError(t, previous.ctx.Err())
 	})
 
+	t.Run("keeps the stored data when the new instance fails late", func(t *testing.T) {
+		app, config := newTestApp(t)
+		ctx := context.Background()
+
+		_, err := app.currentInstance().services.oidcService.UpsertOIDCConsent(ctx, "testuser", "openid", "some-client-id")
+		require.NoError(t, err)
+
+		// the client is gone and the router, which is set up last, fails
+		config.OIDC.Clients = map[string]model.OIDCClientConfig{
+			"other": {ClientID: "other-client-id", ClientSecret: "other-client-secret"},
+		}
+		config.Auth.TrustedProxies = []string{"invalid"}
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		require.ErrorContains(t, app.reload(), "failed to set trusted proxies")
+
+		consents, err := app.queries.ListOIDCConsents(ctx)
+		require.NoError(t, err)
+		assert.Len(t, consents, 1)
+
+		// once the configuration is accepted the consent is removed
+		config.Auth.TrustedProxies = nil
+
+		require.NoError(t, app.reload())
+
+		consents, err = app.queries.ListOIDCConsents(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, consents)
+	})
+
+	t.Run("keeps the instance when the label provider is lost", func(t *testing.T) {
+		app, config := newTestApp(t)
+		previous := app.currentInstance()
+
+		// the previous instance had a label provider, the new one cannot reach it
+		previous.services.dockerService = &service.DockerService{}
+		config.LabelProvider = "docker"
+		t.Setenv("DOCKER_HOST", "")
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		require.ErrorContains(t, app.reload(), "label provider is not available")
+
+		assert.Same(t, previous, app.currentInstance())
+		assert.NoError(t, previous.ctx.Err())
+	})
+
 	t.Run("waits for the requests of the previous instance", func(t *testing.T) {
 		app, config := newTestApp(t)
 		previous := app.currentInstance()
@@ -258,6 +310,14 @@ func TestReload(t *testing.T) {
 func TestReloadRoutine(t *testing.T) {
 	app, config := newTestApp(t)
 
+	reloaded := config
+	reloaded.Apps = map[string]model.App{
+		"bar": {
+			Config: model.AppConfig{Domain: "bar.example.com"},
+			Path:   model.AppPath{Allow: "/.*"},
+		},
+	}
+
 	loads := make(chan struct{}, 2)
 	fail := true
 
@@ -267,7 +327,7 @@ func TestReloadRoutine(t *testing.T) {
 			fail = false
 			return model.Config{}, errors.New("invalid configuration")
 		}
-		return config, nil
+		return reloaded, nil
 	})
 
 	ctx, stop := context.WithCancel(context.Background())
@@ -298,7 +358,9 @@ func TestReloadRoutine(t *testing.T) {
 		t.Fatal("routine did not stop")
 	}
 
-	assert.True(t, allowed(app, "foo.example.com"))
+	// the routine has returned, so the second reload is done
+	assert.False(t, allowed(app, "foo.example.com"))
+	assert.True(t, allowed(app, "bar.example.com"))
 }
 
 func TestRestartRequired(t *testing.T) {
