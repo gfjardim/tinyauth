@@ -16,6 +16,7 @@ import (
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/repository"
+	"github.com/tinyauthapp/tinyauth/internal/service"
 	"github.com/tinyauthapp/tinyauth/internal/utils"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 )
@@ -34,6 +35,9 @@ type instance struct {
 	ding     *ding.Ding
 	dig      *dig.Container
 
+	authCaches *service.AuthCaches
+	oidcCaches *service.OIDCCaches
+
 	// requests being served by this instance
 	requests sync.WaitGroup
 }
@@ -51,6 +55,9 @@ func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
 		queries: app.queries,
 		ding:    ding.New(ctx),
 		dig:     dig.New(),
+
+		authCaches: app.authCaches,
+		oidcCaches: app.oidcCaches,
 	}
 
 	err := inst.setup()
@@ -87,6 +94,9 @@ func (app *instance) setup() error {
 		Ding    *ding.Ding
 		Ctx     context.Context
 		Queries repository.Store
+
+		AuthCaches *service.AuthCaches
+		OIDCCaches *service.OIDCCaches
 	}
 
 	err = app.dig.Provide(func() utilityProvider {
@@ -97,6 +107,9 @@ func (app *instance) setup() error {
 			Ding:    app.ding,
 			Ctx:     app.ctx,
 			Queries: app.queries,
+
+			AuthCaches: app.authCaches,
+			OIDCCaches: app.oidcCaches,
 		}
 	})
 
