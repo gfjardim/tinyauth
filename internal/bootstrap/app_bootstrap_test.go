@@ -575,6 +575,20 @@ func TestNewInstance(t *testing.T) {
 		}
 	})
 
+	t.Run("does not follow the context of the app once it is built", func(t *testing.T) {
+		app, _ := newTestApp(t)
+		inst := app.currentInstance()
+
+		app.cancel()
+
+		// the app stops its listener first and shuts the instance down after
+		select {
+		case <-inst.ctx.Done():
+			t.Fatal("instance was stopped by the context of the app")
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+
 	t.Run("keeps its routines until it is shut down", func(t *testing.T) {
 		app, config := newTestApp(t)
 
