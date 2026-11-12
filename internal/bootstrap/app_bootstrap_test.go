@@ -1140,6 +1140,101 @@ func TestReloadOnShutdown(t *testing.T) {
 		assert.Same(t, previous, app.currentInstance())
 	})
 
+	t.Run("stops an instance that gets ready after the reload gave up", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		// an LDAP server that only answers the bind when it is told to, finds
+		// nothing in a search and reports when the app closes the connection
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { listener.Close() })
+
+		asked := make(chan struct{})
+		answer := make(chan struct{})
+		closed := make(chan struct{})
+
+		go func() {
+			conn, err := listener.Accept()
+
+			if err != nil {
+				return
+			}
+
+			defer conn.Close()
+
+			buffer := make([]byte, 1024)
+
+			if _, err := conn.Read(buffer); err != nil {
+				return
+			}
+
+			close(asked)
+			<-answer
+
+			// a bind response with the result success, for the first message
+			_, _ = conn.Write([]byte{0x30, 0x0c, 0x02, 0x01, 0x01, 0x61, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00})
+
+			for {
+				read, err := conn.Read(buffer)
+
+				if err != nil {
+					close(closed)
+					return
+				}
+
+				// a search, answered as done with the result success
+				if read > 5 && buffer[5] == 0x63 {
+					_, _ = conn.Write([]byte{0x30, 0x0c, 0x02, 0x01, buffer[4], 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00})
+				}
+			}
+		}()
+
+		var release sync.Once
+
+		t.Cleanup(func() {
+			release.Do(func() { close(answer) })
+		})
+
+		config.LDAP.Address = "ldap://" + listener.Addr().String()
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		previous := app.currentInstance()
+		reloaded := make(chan error, 1)
+
+		go func() {
+			reloaded <- app.reload()
+		}()
+
+		select {
+		case <-asked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("instance did not connect to the LDAP server")
+		}
+
+		app.cancel()
+
+		select {
+		case err := <-reloaded:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("reload held the shutdown")
+		}
+
+		// the instance is now built without anyone waiting for it
+		release.Do(func() { close(answer) })
+
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("instance was left running")
+		}
+
+		assert.Same(t, previous, app.currentInstance())
+	})
+
 	t.Run("does not wait for a database that does not answer", func(t *testing.T) {
 		app, config := newTestApp(t)
 
