@@ -1248,9 +1248,12 @@ func TestReloadOnShutdown(t *testing.T) {
 
 		reloaded := make(chan error, 1)
 
-		go func() {
+		// started as the app starts it. The reload goes on to retire the
+		// previous instance, which the app only stops waiting for once the
+		// routine of the reload has returned.
+		app.ding.Go(func(context.Context) {
 			reloaded <- app.reload()
-		}()
+		}, ding.RingMinor)
 
 		select {
 		case <-store.asked:
