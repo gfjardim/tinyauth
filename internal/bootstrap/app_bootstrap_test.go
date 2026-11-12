@@ -165,6 +165,77 @@ func startApp(t *testing.T, config model.Config, loader func() (model.Config, er
 	return base, stop
 }
 
+// fakeLDAP is an LDAP server that only answers the bind when it is told to,
+// finds nothing in a search and reports when the app closes the connection
+type fakeLDAP struct {
+	address string
+	// closed when the bind has arrived
+	asked chan struct{}
+	// closed when the app has closed the connection
+	closed chan struct{}
+	// lets the server answer the bind
+	answer func()
+}
+
+func useFakeLDAP(t *testing.T) *fakeLDAP {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { listener.Close() })
+
+	hold := make(chan struct{})
+
+	var release sync.Once
+
+	server := &fakeLDAP{
+		address: "ldap://" + listener.Addr().String(),
+		asked:   make(chan struct{}),
+		closed:  make(chan struct{}),
+		answer:  func() { release.Do(func() { close(hold) }) },
+	}
+
+	t.Cleanup(server.answer)
+
+	go func() {
+		conn, err := listener.Accept()
+
+		if err != nil {
+			return
+		}
+
+		defer conn.Close()
+
+		buffer := make([]byte, 1024)
+
+		if _, err := conn.Read(buffer); err != nil {
+			return
+		}
+
+		close(server.asked)
+		<-hold
+
+		// a bind response with the result success, for the first message
+		_, _ = conn.Write([]byte{0x30, 0x0c, 0x02, 0x01, 0x01, 0x61, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00})
+
+		for {
+			read, err := conn.Read(buffer)
+
+			if err != nil {
+				close(server.closed)
+				return
+			}
+
+			// a search, answered as done with the result success
+			if read > 5 && buffer[5] == 0x63 {
+				_, _ = conn.Write([]byte{0x30, 0x0c, 0x02, 0x01, buffer[4], 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00})
+			}
+		}
+	}()
+
+	return server
+}
+
 // syncBuffer collects what the logger writes, which comes from several routines
 type syncBuffer struct {
 	mu     sync.Mutex
@@ -1191,59 +1262,9 @@ func TestReloadOnShutdown(t *testing.T) {
 	t.Run("stops an instance that gets ready after the reload gave up", func(t *testing.T) {
 		app, config := newTestApp(t)
 
-		// an LDAP server that only answers the bind when it is told to, finds
-		// nothing in a search and reports when the app closes the connection
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		t.Cleanup(func() { listener.Close() })
-
-		asked := make(chan struct{})
-		answer := make(chan struct{})
-		closed := make(chan struct{})
-
-		go func() {
-			conn, err := listener.Accept()
-
-			if err != nil {
-				return
-			}
-
-			defer conn.Close()
-
-			buffer := make([]byte, 1024)
-
-			if _, err := conn.Read(buffer); err != nil {
-				return
-			}
-
-			close(asked)
-			<-answer
-
-			// a bind response with the result success, for the first message
-			_, _ = conn.Write([]byte{0x30, 0x0c, 0x02, 0x01, 0x01, 0x61, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00})
-
-			for {
-				read, err := conn.Read(buffer)
-
-				if err != nil {
-					close(closed)
-					return
-				}
-
-				// a search, answered as done with the result success
-				if read > 5 && buffer[5] == 0x63 {
-					_, _ = conn.Write([]byte{0x30, 0x0c, 0x02, 0x01, buffer[4], 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00})
-				}
-			}
-		}()
-
-		var release sync.Once
-
-		t.Cleanup(func() {
-			release.Do(func() { close(answer) })
-		})
-
-		config.LDAP.Address = "ldap://" + listener.Addr().String()
+		// the bind holds the build until the server is told to answer
+		server := useFakeLDAP(t)
+		config.LDAP.Address = server.address
 
 		app.WithConfigLoader(func() (model.Config, error) {
 			return config, nil
@@ -1257,7 +1278,7 @@ func TestReloadOnShutdown(t *testing.T) {
 		}()
 
 		select {
-		case <-asked:
+		case <-server.asked:
 		case <-time.After(15 * time.Second):
 			t.Fatal("instance did not connect to the LDAP server")
 		}
@@ -1272,10 +1293,10 @@ func TestReloadOnShutdown(t *testing.T) {
 		}
 
 		// the instance is now built without anyone waiting for it
-		release.Do(func() { close(answer) })
+		server.answer()
 
 		select {
-		case <-closed:
+		case <-server.closed:
 		case <-time.After(15 * time.Second):
 			t.Fatal("instance was left running")
 		}
