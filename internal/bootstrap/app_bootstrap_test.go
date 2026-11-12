@@ -609,12 +609,22 @@ func TestNewInstance(t *testing.T) {
 		app, _ := newTestApp(t)
 		inst := app.currentInstance()
 
+		// a routine of the instance, as its services start them
+		ended := make(chan struct{})
+
+		inst.ding.Go(func(ctx context.Context) {
+			<-ctx.Done()
+			close(ended)
+		}, ding.RingMajor)
+
 		app.cancel()
 
 		// the app stops its listener first and shuts the instance down after
 		select {
 		case <-inst.ctx.Done():
 			t.Fatal("instance was stopped by the context of the app")
+		case <-ended:
+			t.Fatal("routines of the instance were stopped by the context of the app")
 		case <-time.After(200 * time.Millisecond):
 		}
 	})
