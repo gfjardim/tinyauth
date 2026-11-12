@@ -437,6 +437,86 @@ func TestReloadRoutine(t *testing.T) {
 	assert.True(t, allowed(app, "bar.example.com"))
 }
 
+func TestReloadOnShutdown(t *testing.T) {
+	t.Run("does not wait for an instance that is still connecting", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		// an LDAP server that accepts the connection and never answers, which
+		// the LDAP client waits for whatever happens to its context
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		accepted := make(chan net.Conn, 16)
+
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					close(accepted)
+					return
+				}
+				accepted <- conn
+			}
+		}()
+
+		t.Cleanup(func() {
+			listener.Close()
+			for conn := range accepted {
+				conn.Close()
+			}
+		})
+
+		config.LDAP.Address = "ldap://" + listener.Addr().String()
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		previous := app.currentInstance()
+		reloaded := make(chan error, 1)
+
+		go func() {
+			reloaded <- app.reload()
+		}()
+
+		// let the service connect
+		time.Sleep(200 * time.Millisecond)
+		app.cancel()
+
+		select {
+		case err := <-reloaded:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("reload held the shutdown")
+		}
+
+		assert.Same(t, previous, app.currentInstance())
+	})
+
+	t.Run("ignores a signal that is still pending", func(t *testing.T) {
+		app, config := newTestApp(t)
+		loads := 0
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			loads++
+			return config, nil
+		})
+
+		ctx, stop := context.WithCancel(context.Background())
+		stop()
+
+		// which of the two the routine sees first is random, so try a few times
+		for range 20 {
+			sighup := make(chan os.Signal, 1)
+			sighup <- syscall.SIGHUP
+
+			app.reloadRoutine(ctx, sighup)
+		}
+
+		assert.Zero(t, loads)
+	})
+}
+
 func TestRestartRequired(t *testing.T) {
 	app, config := newTestApp(t)
 
