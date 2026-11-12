@@ -905,6 +905,9 @@ func TestReload(t *testing.T) {
 		app, config := newTestApp(t)
 		previous := app.currentInstance()
 
+		// the time it gets unless a test shortens it
+		require.Equal(t, model.GracefulShutdownTimeout*time.Second, app.drainTimeout)
+
 		app.drainTimeout = 300 * time.Millisecond
 
 		app.WithConfigLoader(func() (model.Config, error) {
