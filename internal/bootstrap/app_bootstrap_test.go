@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -287,6 +288,54 @@ users:
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 
 	return cluster
+}
+
+// holdRequest sends the app a login whose body is not complete, so that the
+// instance serving it keeps waiting, and returns the function that completes it
+func holdRequest(t *testing.T, app *BootstrapApp) func() {
+	t.Helper()
+
+	reader, writer := io.Pipe()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/user/login", reader)
+	req.Header.Set("Content-Type", "application/json")
+
+	served := make(chan struct{})
+
+	go func() {
+		app.ServeHTTP(httptest.NewRecorder(), req)
+		close(served)
+	}()
+
+	// the write returns once the handler has read it, so from then on the
+	// request is being served
+	written := make(chan error, 1)
+
+	go func() {
+		_, err := writer.Write([]byte(`{"username":"testuser",`))
+		written <- err
+	}()
+
+	select {
+	case err := <-written:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not reach the handler")
+	}
+
+	var once sync.Once
+
+	finish := func() {
+		once.Do(func() {
+			_, _ = writer.Write([]byte(`"password":"wrong"}`))
+			writer.Close()
+			<-served
+		})
+	}
+
+	t.Cleanup(finish)
+
+	return finish
 }
 
 func stopped(inst *instance) bool {
@@ -618,8 +667,7 @@ func TestReload(t *testing.T) {
 			return config, nil
 		})
 
-		// a request still being served
-		previous.requests.Add(1)
+		finish := holdRequest(t, app)
 
 		require.NoError(t, app.reload())
 
@@ -629,7 +677,30 @@ func TestReload(t *testing.T) {
 		case <-time.After(200 * time.Millisecond):
 		}
 
-		previous.requests.Done()
+		finish()
+
+		assert.True(t, stopped(previous))
+	})
+
+	t.Run("stops the previous instance when its requests take too long", func(t *testing.T) {
+		app, config := newTestApp(t)
+		previous := app.currentInstance()
+
+		app.drainTimeout = 300 * time.Millisecond
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		holdRequest(t, app)
+
+		require.NoError(t, app.reload())
+
+		select {
+		case <-previous.ctx.Done():
+			t.Fatal("previous instance stopped before its time was over")
+		case <-time.After(100 * time.Millisecond):
+		}
 
 		assert.True(t, stopped(previous))
 	})
