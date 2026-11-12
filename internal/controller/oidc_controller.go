@@ -435,6 +435,20 @@ func (controller *OIDCController) authorizeComplete(c *gin.Context) {
 		return
 	}
 
+	// The ticket is kept when the configuration is reloaded, so the request
+	// has to be valid for the current configuration too
+	err = controller.oidc.ValidateAuthorizeParams(*authorizeReq)
+
+	if err != nil {
+		controller.authorizeError(c, authorizeErrorParams{
+			err:          err,
+			reason:       "Authorize request is no longer valid",
+			reasonPublic: "The authorization request is no longer valid",
+			json:         true,
+		})
+		return
+	}
+
 	// Create the sub to find and delete old sessions
 	sub := controller.oidc.CreateSub(*userContext, authorizeReq.ClientID)
 
@@ -597,7 +611,9 @@ func (controller *OIDCController) Token(c *gin.Context) {
 		// mark code as used to prevent reuse
 		controller.oidc.MarkCodeAsUsed(controller.oidc.Hash(req.Code), entry.Userinfo.Sub)
 
-		if entry.RedirectURI != req.RedirectURI {
+		// The code is kept when the configuration is reloaded, so its redirect
+		// URI has to be trusted by the current configuration too
+		if entry.RedirectURI != req.RedirectURI || !slices.Contains(client.TrustedRedirectURIs, entry.RedirectURI) {
 			controller.log.App.Warn().Msg("Redirect URI does not match")
 			c.JSON(400, gin.H{
 				"error": "invalid_grant",

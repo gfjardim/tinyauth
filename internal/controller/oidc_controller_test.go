@@ -662,6 +662,35 @@ func TestOIDCController(t *testing.T) {
 				assert.False(t, ok)
 			},
 		},
+		{
+			description: "Authorize complete returns an error when the redirect URI is no longer trusted",
+			middlewares: []gin.HandlerFunc{authedUser},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				// a ticket from a configuration that trusted another redirect URI
+				ticket := oidcService.CreateAuthorizeRequestTicket(service.AuthorizeRequest{
+					Scope:        "openid",
+					ResponseType: "code",
+					ClientID:     "some-client-id",
+					RedirectURI:  "https://old.example.com/callback",
+				})
+
+				body, err := json.Marshal(AuthorizeCompleteRequest{Ticket: ticket})
+				require.NoError(t, err)
+
+				req := httptest.NewRequest("POST", "/api/oidc/authorize-complete", strings.NewReader(string(body)))
+				req.Header.Set("Content-Type", "application/json")
+				router.ServeHTTP(recorder, req)
+
+				assert.Equal(t, http.StatusOK, recorder.Code)
+
+				var res map[string]any
+				require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &res))
+				redirectURI, ok := res["redirect_uri"].(string)
+				require.True(t, ok)
+				assert.Contains(t, redirectURI, oidcService.GetIssuer()+"/error")
+				assert.NotContains(t, redirectURI, "code=")
+			},
+		},
 
 		// --- token ---
 		{
@@ -785,6 +814,36 @@ func TestOIDCController(t *testing.T) {
 				form.Set("client_secret", "some-client-secret")
 				form.Set("code", code)
 				form.Set("redirect_uri", "https://test.example.com/different")
+
+				req := httptest.NewRequest("POST", "/api/oidc/token", strings.NewReader(form.Encode()))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				router.ServeHTTP(recorder, req)
+
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), "invalid_grant")
+			},
+		},
+		{
+			description: "Token returns 400 when the redirect URI of the code is no longer trusted",
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				// a code from a configuration that trusted another redirect URI
+				code := oidcService.CreateCode(service.AuthorizeRequest{
+					Scope:        "openid",
+					ResponseType: "code",
+					ClientID:     "some-client-id",
+					RedirectURI:  "https://old.example.com/callback",
+				}, model.UserContext{
+					Authenticated: true,
+					Provider:      model.ProviderLocal,
+					Local:         &model.LocalContext{BaseContext: model.BaseContext{Username: "testuser"}},
+				})
+
+				form := url.Values{}
+				form.Set("grant_type", "authorization_code")
+				form.Set("client_id", "some-client-id")
+				form.Set("client_secret", "some-client-secret")
+				form.Set("code", code)
+				form.Set("redirect_uri", "https://old.example.com/callback")
 
 				req := httptest.NewRequest("POST", "/api/oidc/token", strings.NewReader(form.Encode()))
 				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
