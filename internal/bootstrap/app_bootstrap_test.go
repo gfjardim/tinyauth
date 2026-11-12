@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -236,6 +237,57 @@ func TestSetup(t *testing.T) {
 		}, 5*time.Second, 20*time.Millisecond, "app did not reload")
 
 		assert.False(t, allowedAt(t, base, "foo.example.com"))
+		assert.NoError(t, stop())
+	})
+
+	t.Run("keeps a SIGHUP that arrives while it starts", func(t *testing.T) {
+		config := newTestConfig(t)
+
+		reloaded := config
+		reloaded.Apps = map[string]model.App{
+			"bar": {
+				Config: model.AppConfig{Domain: "bar.example.com"},
+				Path:   model.AppPath{Allow: "/.*"},
+			},
+		}
+
+		// a docker daemon that sends the signal when the app connects to it,
+		// which is while the services are being built
+		var once sync.Once
+
+		docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Api-Version", "1.45")
+			w.Header().Set("Content-Type", "application/json")
+
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/_ping"):
+				once.Do(func() { signalSelf(t, syscall.SIGHUP) })
+				_, _ = w.Write([]byte("OK"))
+			case strings.HasSuffix(r.URL.Path, "/containers/json"):
+				_, _ = w.Write([]byte("[]"))
+			case strings.HasSuffix(r.URL.Path, "/events"):
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+
+		t.Cleanup(docker.Close)
+		t.Setenv("DOCKER_HOST", "tcp://"+docker.Listener.Addr().String())
+
+		config.LabelProvider = "docker"
+		reloaded.LabelProvider = "docker"
+
+		base, stop := startApp(t, config, func() (model.Config, error) {
+			return reloaded, nil
+		})
+
+		require.Eventually(t, func() bool {
+			return allowedAt(t, base, "bar.example.com")
+		}, 5*time.Second, 20*time.Millisecond, "app did not reload")
+
 		assert.NoError(t, stop())
 	})
 }

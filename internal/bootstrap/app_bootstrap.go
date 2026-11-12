@@ -83,6 +83,17 @@ func (app *BootstrapApp) Setup() error {
 	app.ctx = ctx
 	app.cancel = cancel
 
+	// take SIGHUP over before anything else, so that it does not end the app
+	// while it starts. A signal that arrives meanwhile is kept for the reload
+	// routine.
+	var sighup chan os.Signal
+
+	if app.configLoader != nil {
+		sighup = make(chan os.Signal, 1)
+		signal.Notify(sighup, syscall.SIGHUP)
+		defer signal.Stop(sighup)
+	}
+
 	// create a ding instance
 	dg := ding.New(ctx)
 	app.ding = dg
@@ -156,11 +167,7 @@ func (app *BootstrapApp) Setup() error {
 
 	// reload the configuration on SIGHUP
 	if app.configLoader != nil {
-		sighup := make(chan os.Signal, 1)
-		signal.Notify(sighup, syscall.SIGHUP)
-
 		app.ding.Go(func(ctx context.Context) {
-			defer signal.Stop(sighup)
 			app.reloadRoutine(ctx, sighup)
 		}, ding.RingMinor)
 	}
