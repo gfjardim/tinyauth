@@ -356,6 +356,12 @@ func (app *BootstrapApp) reloadRoutine(ctx context.Context, sighup <-chan os.Sig
 			app.log.App.Info().Msg("Received SIGHUP, reloading configuration")
 
 			if err := app.reload(); err != nil {
+				// a reload that the shutdown interrupted was not refused
+				if app.ctx.Err() != nil {
+					app.log.App.Debug().Err(err).Msg("Configuration reload interrupted by the shutdown")
+					continue
+				}
+
 				app.log.App.Error().Err(err).Msg("Failed to reload configuration, keeping the previous one")
 				continue
 			}

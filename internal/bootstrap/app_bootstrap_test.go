@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -162,6 +163,24 @@ func startApp(t *testing.T, config model.Config, loader func() (model.Config, er
 	}, 15*time.Second, 20*time.Millisecond, "app did not start serving")
 
 	return base, stop
+}
+
+// syncBuffer collects what the logger writes, which comes from several routines
+type syncBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
 }
 
 // sendSelf sends a signal to the process of the test
@@ -1036,6 +1055,11 @@ func TestReload(t *testing.T) {
 func TestReloadRoutine(t *testing.T) {
 	app, config := newTestApp(t)
 
+	output := &syncBuffer{}
+	log := logger.NewLogger().WithTestConfig().WithWriter(output)
+	log.Init()
+	app.log = log
+
 	reloaded := config
 	reloaded.Apps = map[string]model.App{
 		"bar": {
@@ -1093,6 +1117,9 @@ func TestReloadRoutine(t *testing.T) {
 	// the routine has returned, so the second reload is done
 	assert.False(t, allowed(app, "foo.example.com"))
 	assert.True(t, allowed(app, "bar.example.com"))
+
+	// the first one was reported
+	assert.Contains(t, output.String(), "Failed to reload configuration")
 }
 
 func TestReloadOnShutdown(t *testing.T) {
@@ -1318,6 +1345,48 @@ func TestReloadOnShutdown(t *testing.T) {
 		}
 
 		assert.Zero(t, loads)
+	})
+
+	t.Run("does not report a reload that the shutdown interrupted as failed", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		output := &syncBuffer{}
+		log := logger.NewLogger().WithTestConfig().WithWriter(output)
+		log.Init()
+		app.log = log
+
+		// the shutdown arrives behind the signal, once the routine has
+		// taken it and is loading the configuration
+		app.WithConfigLoader(func() (model.Config, error) {
+			app.cancel()
+			return config, nil
+		})
+
+		ctx, stop := context.WithCancel(context.Background())
+		sighup := make(chan os.Signal)
+		done := make(chan struct{})
+
+		go func() {
+			app.reloadRoutine(ctx, sighup)
+			close(done)
+		}()
+
+		select {
+		case sighup <- syscall.SIGHUP:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not take the signal")
+		}
+
+		stop()
+
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("routine did not stop")
+		}
+
+		assert.Contains(t, output.String(), "Received SIGHUP, reloading configuration")
+		assert.NotContains(t, output.String(), "Failed to reload configuration")
 	})
 }
 
