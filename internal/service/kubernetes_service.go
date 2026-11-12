@@ -124,7 +124,7 @@ type KubernetesService struct {
 	mu          sync.RWMutex
 	connected   bool
 
-	// first listing of the watched resources: how many are still to come, the
+	// first listing of the supported resources: how many are still to come, the
 	// error of one that failed, and the channel closed when all are over.
 	// The first two are guarded by mu.
 	pending int
@@ -166,7 +166,12 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 	service.client = client
 	service.typedClient = typedClient
 
-	watched := make([]watchedResource, 0, len(supportedResources))
+	// every supported resource reports once: a watched one when its first
+	// listing is over, one that is skipped right away. The count is set
+	// before the first watcher starts, so it is complete when one reports.
+	service.pending = len(supportedResources)
+
+	watchedGVRs := make(map[string]bool)
 
 	for _, res := range supportedResources {
 		ctx, cancel := context.WithTimeout(i.Ctx, 10*time.Second)
@@ -176,26 +181,21 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 		if err != nil {
 			// The CRD may not be available yet, so we'll fall back to ingress
 			i.Log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to access resource, skipping watcher")
+			service.firstListingDone(nil)
 			continue
 		}
 
 		i.Log.App.Debug().Str("res", res.pretty()).Msg("Successfully accessed resource, starting watcher")
 
-		watched = append(watched, res)
-	}
-
-	if len(watched) == 0 {
-		return nil, fmt.Errorf("failed to access any supported kubernetes api (ingresses, httproutes, grpcroutes)")
-	}
-
-	// the watchers are started once all are known, so that the count of
-	// first listings to come is complete before any of them reports
-	service.pending = len(watched)
-
-	for _, res := range watched {
 		i.Ding.Go(func(ctx context.Context) {
 			service.watchGVR(res, ctx)
 		}, ding.RingMajor)
+
+		watchedGVRs[res.gvr.Resource] = true
+	}
+
+	if len(watchedGVRs) == 0 {
+		return nil, fmt.Errorf("failed to access any supported kubernetes api (ingresses, httproutes, grpcroutes)")
 	}
 
 	service.connected = true
@@ -418,7 +418,8 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 	}
 }
 
-// firstListingDone records how the first listing of a watched resource went
+// firstListingDone records how the first listing of a supported resource
+// went. A resource that is not watched is recorded without being listed.
 func (k *KubernetesService) firstListingDone(err error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()

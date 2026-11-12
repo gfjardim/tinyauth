@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -199,10 +200,23 @@ func allowedAt(base string, domain string) bool {
 // fakeKubernetes is the API of a cluster with one ingress, whose annotations
 // allow any path of foo.example.com. The listing that loads the labels can be
 // held back or made to fail.
+//
+// The cluster can also be given the applications resource, with one
+// application that allows any path of bar.example.com. The probe of that
+// resource, the request the service makes before it watches a resource, can
+// be held back or made to fail.
 type fakeKubernetes struct {
 	mu   sync.Mutex
 	hold chan struct{}
 	fail bool
+
+	applications bool
+	holdProbe    chan struct{}
+	failProbe    int
+
+	// gets "probe" or "list" and the name of the resource when a probe or a
+	// listing that loads the labels arrives
+	requests chan string
 }
 
 func (cluster *fakeKubernetes) set(hold chan struct{}, fail bool) {
@@ -212,50 +226,108 @@ func (cluster *fakeKubernetes) set(hold chan struct{}, fail bool) {
 	cluster.fail = fail
 }
 
+// setApplications gives the cluster the applications resource. The probe of
+// the resource waits for hold, if any, and fails with the given status code,
+// if any.
+func (cluster *fakeKubernetes) setApplications(hold chan struct{}, fail int) {
+	cluster.mu.Lock()
+	defer cluster.mu.Unlock()
+	cluster.applications = true
+	cluster.holdProbe = hold
+	cluster.failProbe = fail
+}
+
 func (cluster *fakeKubernetes) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	const ingresses = `{"kind":"IngressList","apiVersion":"networking.k8s.io/v1","metadata":{"resourceVersion":"1"},"items":[` +
 		`{"kind":"Ingress","apiVersion":"networking.k8s.io/v1","metadata":{"name":"foo","namespace":"default","annotations":` +
 		`{"tinyauth.apps.foo.config.domain":"foo.example.com","tinyauth.apps.foo.path.allow":"/.*"}},` +
 		`"spec":{"rules":[{"host":"foo.example.com"}]}}]}`
 
-	failure := func(code int, reason string) {
+	const applications = `{"kind":"ApplicationList","apiVersion":"tinyauth.app/v1alpha1","metadata":{"resourceVersion":"1"},"items":[` +
+		`{"kind":"Application","apiVersion":"tinyauth.app/v1alpha1","metadata":{"name":"bar","namespace":"default"},` +
+		`"spec":{"config":{"domain":"bar.example.com"},"path":{"allow":"/.*"}}}]}`
+
+	failure := func(code int) {
 		w.WriteHeader(code)
-		fmt.Fprintf(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":%q,"code":%d}`, reason, code)
+		fmt.Fprintf(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":%q,"code":%d}`,
+			strings.ReplaceAll(http.StatusText(code), " ", ""), code)
 	}
 
+	// waits for the channel, if any, and reports whether the request is still there
+	wait := func(hold chan struct{}) bool {
+		if hold == nil {
+			return true
+		}
+
+		select {
+		case <-hold:
+			return true
+		case <-r.Context().Done():
+			return false
+		}
+	}
+
+	arrived := func(request string) {
+		select {
+		case cluster.requests <- request + " " + path.Base(r.URL.Path):
+		default:
+		}
+	}
+
+	cluster.mu.Lock()
+	hold, fail := cluster.hold, cluster.fail
+	hasApplications, holdProbe, failProbe := cluster.applications, cluster.holdProbe, cluster.failProbe
+	cluster.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
+
+	var items string
+
+	switch {
+	case r.URL.Path == "/apis/networking.k8s.io/v1/ingresses":
+		items = ingresses
+		holdProbe, failProbe = nil, 0
+	case r.URL.Path == "/apis/tinyauth.app/v1alpha1/applications" && hasApplications:
+		items = applications
+	default:
+		failure(http.StatusNotFound)
+		return
+	}
 
 	query := r.URL.Query()
 
 	switch {
-	case r.URL.Path != "/apis/networking.k8s.io/v1/ingresses":
-		failure(http.StatusNotFound, "NotFound")
 	case query.Get("watch") != "":
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	case query.Get("limit") == "1":
 		// the probe the service makes before it starts watching
-		fmt.Fprint(w, ingresses)
-	default:
-		cluster.mu.Lock()
-		hold, fail := cluster.hold, cluster.fail
-		cluster.mu.Unlock()
+		arrived("probe")
 
-		if hold != nil {
-			select {
-			case <-hold:
-			case <-r.Context().Done():
-				return
-			}
-		}
-
-		if fail {
-			failure(http.StatusServiceUnavailable, "ServiceUnavailable")
+		if !wait(holdProbe) {
 			return
 		}
 
-		fmt.Fprint(w, ingresses)
+		if failProbe != 0 {
+			failure(failProbe)
+			return
+		}
+
+		fmt.Fprint(w, items)
+	default:
+		arrived("list")
+
+		if !wait(hold) {
+			return
+		}
+
+		if fail {
+			failure(http.StatusServiceUnavailable)
+			return
+		}
+
+		fmt.Fprint(w, items)
 	}
 }
 
@@ -263,7 +335,7 @@ func (cluster *fakeKubernetes) ServeHTTP(w http.ResponseWriter, r *http.Request)
 func useFakeKubernetes(t *testing.T) *fakeKubernetes {
 	t.Helper()
 
-	cluster := &fakeKubernetes{}
+	cluster := &fakeKubernetes{requests: make(chan string, 16)}
 	server := httptest.NewServer(cluster)
 
 	// the watches are still open when the test ends, closing has to end them
@@ -500,6 +572,57 @@ func TestNewInstance(t *testing.T) {
 			assert.ErrorContains(t, err, "failed to connect to ldap server")
 		case <-time.After(2 * time.Second):
 			t.Fatal("instance kept building after the app was shut down")
+		}
+	})
+}
+
+func TestKubernetesLabels(t *testing.T) {
+	t.Run("are loaded for a resource while the next one is still probed", func(t *testing.T) {
+		app, config := newTestApp(t)
+		cluster := useFakeKubernetes(t)
+
+		// the service looks at the applications after the ingresses
+		hold := make(chan struct{})
+		cluster.setApplications(hold, 0)
+
+		config.LabelProvider = "kubernetes"
+
+		built := make(chan *instance, 1)
+
+		go func() {
+			inst, _ := app.newInstance(config)
+			built <- inst
+		}()
+
+		var release sync.Once
+
+		t.Cleanup(func() {
+			release.Do(func() { close(hold) })
+
+			if inst := <-built; inst != nil {
+				inst.shutdown()
+			}
+		})
+
+		// the probe gives up after 10 seconds, the listing has to come before
+		var probing <-chan time.Time
+
+		limit := time.After(30 * time.Second)
+
+		for listed := false; !listed; {
+			select {
+			case request := <-cluster.requests:
+				switch request {
+				case "probe applications":
+					probing = time.After(5 * time.Second)
+				case "list ingresses":
+					listed = true
+				}
+			case <-probing:
+				t.Fatal("labels of the ingresses were not loaded while the applications were probed")
+			case <-limit:
+				t.Fatal("service did not get to the cluster")
+			}
 		}
 	})
 }
