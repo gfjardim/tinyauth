@@ -346,8 +346,10 @@ func (app *BootstrapApp) reloadRoutine(ctx context.Context, sighup <-chan os.Sig
 	for {
 		select {
 		case <-sighup:
-			// a signal that was pending when the app is shut down
-			if ctx.Err() != nil {
+			// a signal that arrives with the shutdown. The context of the
+			// app is looked at because the one of the routine is only
+			// cancelled a moment later.
+			if app.ctx.Err() != nil {
 				continue
 			}
 

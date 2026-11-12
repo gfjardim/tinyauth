@@ -1155,7 +1155,7 @@ func TestReloadOnShutdown(t *testing.T) {
 		}
 	})
 
-	t.Run("ignores a signal that is still pending", func(t *testing.T) {
+	t.Run("ignores a signal that arrives with the shutdown", func(t *testing.T) {
 		app, config := newTestApp(t)
 		loads := 0
 
@@ -1164,15 +1164,31 @@ func TestReloadOnShutdown(t *testing.T) {
 			return config, nil
 		})
 
+		// the context of the app is cancelled first, the one of the routine
+		// only once the app gets to stopping it
+		app.cancel()
+
 		ctx, stop := context.WithCancel(context.Background())
+		sighup := make(chan os.Signal)
+		done := make(chan struct{})
+
+		go func() {
+			app.reloadRoutine(ctx, sighup)
+			close(done)
+		}()
+
+		select {
+		case sighup <- syscall.SIGHUP:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not take the signal")
+		}
+
 		stop()
 
-		// which of the two the routine sees first is random, so try a few times
-		for range 20 {
-			sighup := make(chan os.Signal, 1)
-			sighup <- syscall.SIGHUP
-
-			app.reloadRoutine(ctx, sighup)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not stop")
 		}
 
 		assert.Zero(t, loads)
