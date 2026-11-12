@@ -19,16 +19,21 @@ func TestLoadConfig(t *testing.T) {
 		&loaders.EnvLoader{},
 	}
 
-	configFile := filepath.Join(t.TempDir(), "config.yml")
-	args := []string{"--configfile=" + configFile}
+	// every subtest gets its own file, so that each can run alone
+	newConfigFile := func(t *testing.T) (string, []string) {
+		t.Helper()
+		configFile := filepath.Join(t.TempDir(), "config.yml")
+		return configFile, []string{"--configfile=" + configFile}
+	}
 
-	writeConfig := func(t *testing.T, contents string) {
+	writeConfig := func(t *testing.T, configFile string, contents string) {
 		t.Helper()
 		require.NoError(t, os.WriteFile(configFile, []byte(contents), 0600))
 	}
 
 	t.Run("loads the configuration over the defaults", func(t *testing.T) {
-		writeConfig(t, "apps:\n  foo:\n    config:\n      domain: foo.example.com\n")
+		configFile, args := newConfigFile(t)
+		writeConfig(t, configFile, "apps:\n  foo:\n    config:\n      domain: foo.example.com\n")
 
 		cfg, err := loadConfig(args, resources)
 		require.NoError(t, err)
@@ -40,7 +45,13 @@ func TestLoadConfig(t *testing.T) {
 	})
 
 	t.Run("reads the file again on every call", func(t *testing.T) {
-		writeConfig(t, "apps:\n  bar:\n    config:\n      domain: bar.example.com\n")
+		configFile, args := newConfigFile(t)
+		writeConfig(t, configFile, "apps:\n  foo:\n    config:\n      domain: foo.example.com\n")
+
+		_, err := loadConfig(args, resources)
+		require.NoError(t, err)
+
+		writeConfig(t, configFile, "apps:\n  bar:\n    config:\n      domain: bar.example.com\n")
 
 		cfg, err := loadConfig(args, resources)
 		require.NoError(t, err)
@@ -51,14 +62,15 @@ func TestLoadConfig(t *testing.T) {
 	})
 
 	t.Run("returns an error for a malformed file", func(t *testing.T) {
-		writeConfig(t, "apps: [")
+		configFile, args := newConfigFile(t)
+		writeConfig(t, configFile, "apps: [")
 
 		_, err := loadConfig(args, resources)
 		assert.Error(t, err)
 	})
 
 	t.Run("returns an error for a missing file", func(t *testing.T) {
-		require.NoError(t, os.Remove(configFile))
+		_, args := newConfigFile(t)
 
 		_, err := loadConfig(args, resources)
 		assert.Error(t, err)
