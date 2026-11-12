@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -187,10 +188,14 @@ func TestReload(t *testing.T) {
 		app, config := newTestApp(t)
 		previous := app.currentInstance()
 
-		// the previous instance had a label provider, the new one cannot reach it
-		previous.services.dockerService = &service.DockerService{}
-		config.LabelProvider = "docker"
-		t.Setenv("DOCKER_HOST", "")
+		// the previous instance had a label provider, the new one cannot reach
+		// it. Kubernetes without any configuration fails whatever the host runs.
+		previous.services.kubernetesService = &service.KubernetesService{}
+		config.LabelProvider = "kubernetes"
+		t.Setenv("KUBERNETES_SERVICE_HOST", "")
+		t.Setenv("KUBERNETES_SERVICE_PORT", "")
+		t.Setenv("KUBERNETES_MASTER", "")
+		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing"))
 
 		app.WithConfigLoader(func() (model.Config, error) {
 			return config, nil
