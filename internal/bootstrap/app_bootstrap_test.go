@@ -574,6 +574,37 @@ func TestNewInstance(t *testing.T) {
 			t.Fatal("instance kept building after the app was shut down")
 		}
 	})
+
+	t.Run("keeps its routines until it is shut down", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		inst, err := app.prepareInstance(config)
+		require.NoError(t, err)
+
+		ended := make(chan struct{})
+
+		inst.ding.Go(func(ctx context.Context) {
+			<-ctx.Done()
+			close(ended)
+		}, ding.RingMajor)
+
+		// what the shutdown of the app does to an instance that is being built
+		inst.cancel(context.Canceled)
+
+		select {
+		case <-ended:
+			t.Fatal("routine was stopped while the instance was still being built")
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		inst.shutdown()
+
+		select {
+		case <-ended:
+		default:
+			t.Fatal("routine was not stopped by the shutdown")
+		}
+	})
 }
 
 func TestKubernetesLabels(t *testing.T) {

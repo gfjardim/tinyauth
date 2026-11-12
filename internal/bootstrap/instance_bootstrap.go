@@ -35,6 +35,9 @@ type instance struct {
 	ding     *ding.Ding
 	dig      *dig.Container
 
+	// stops the routines in the ding, which have a context of their own
+	stopRoutines context.CancelFunc
+
 	authCaches *service.AuthCaches
 	oidcCaches *service.OIDCCaches
 
@@ -63,15 +66,22 @@ func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
 func (app *BootstrapApp) prepareInstance(config model.Config) (*instance, error) {
 	// once it is built the instance does not follow the app context, the app
 	// shuts it down after the listener has stopped
-	ctx, cancel := context.WithCancelCause(context.WithoutCancel(app.ctx))
+	detached := context.WithoutCancel(app.ctx)
+	ctx, cancel := context.WithCancelCause(detached)
+
+	// the context of the services is cancelled when the app is shut down
+	// while they are being built. The routines must not stop with it: a ding
+	// that is stopping while routines are still added to it can panic.
+	routines, stopRoutines := context.WithCancel(detached)
 
 	inst := &instance{
-		config: config,
-		log:    app.log,
-		ctx:    ctx,
-		cancel: cancel,
-		ding:   ding.New(ctx),
-		dig:    dig.New(),
+		config:       config,
+		log:          app.log,
+		ctx:          ctx,
+		cancel:       cancel,
+		ding:         ding.New(routines),
+		dig:          dig.New(),
+		stopRoutines: stopRoutines,
 	}
 
 	err := inst.setupRuntime()
@@ -136,6 +146,7 @@ func (app *instance) reconcile(ctx context.Context) {
 // shutdown stops the routines of the instance and waits for them to finish
 func (app *instance) shutdown() {
 	app.cancel(nil)
+	app.stopRoutines()
 	app.ding.Wait()
 }
 
