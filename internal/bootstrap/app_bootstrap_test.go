@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -24,11 +26,8 @@ import (
 	"github.com/tinyauthapp/tinyauth/pkg/cache"
 )
 
-func newTestApp(t *testing.T) (*BootstrapApp, model.Config) {
+func newTestConfig(t *testing.T) model.Config {
 	t.Helper()
-
-	log := logger.NewLogger().WithTestConfig()
-	log.Init()
 
 	config, _ := test.CreateTestConfigs(t)
 
@@ -45,6 +44,17 @@ func newTestApp(t *testing.T) (*BootstrapApp, model.Config) {
 	config.OAuth.Providers = map[string]model.OAuthServiceConfig{
 		"github": {ClientID: "client-id", ClientSecret: "client-secret"},
 	}
+
+	return config
+}
+
+func newTestApp(t *testing.T) (*BootstrapApp, model.Config) {
+	t.Helper()
+
+	log := logger.NewLogger().WithTestConfig()
+	log.Init()
+
+	config := newTestConfig(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -85,6 +95,96 @@ func allowed(app *BootstrapApp, domain string) bool {
 	return rec.Code == http.StatusOK
 }
 
+// startApp runs the setup as the command does, with a real listener, and
+// waits for it to serve. The returned function shuts the app down with a
+// SIGTERM and returns what the setup returned.
+func startApp(t *testing.T, config model.Config, loader func() (model.Config, error)) (string, func() error) {
+	t.Helper()
+
+	// a SIGHUP that the app does not take must fail the test, not end the process
+	guard := make(chan os.Signal, 1)
+	signal.Notify(guard, syscall.SIGHUP)
+	t.Cleanup(func() { signal.Stop(guard) })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().(*net.TCPAddr)
+	require.NoError(t, listener.Close())
+
+	config.Server.Address = address.IP.String()
+	config.Server.Port = address.Port
+	config.Database.Driver = "memory"
+	config.Analytics.Enabled = false
+	config.Log.Level = "disabled"
+
+	app := NewBootstrapApp(config).WithConfigLoader(loader)
+	returned := make(chan error, 1)
+
+	go func() {
+		returned <- app.Setup()
+	}()
+
+	var once sync.Once
+	var result error
+
+	stop := func() error {
+		once.Do(func() {
+			signalSelf(t, syscall.SIGTERM)
+
+			select {
+			case result = <-returned:
+			case <-time.After(10 * time.Second):
+				result = errors.New("setup did not return after SIGTERM")
+			}
+
+			app.cancel()
+		})
+
+		return result
+	}
+
+	t.Cleanup(func() { _ = stop() })
+
+	base := "http://" + address.String()
+
+	require.Eventually(t, func() bool {
+		res, err := http.Get(base + "/api/healthz")
+		if err != nil {
+			return false
+		}
+		res.Body.Close()
+		return res.StatusCode == http.StatusOK
+	}, 10*time.Second, 20*time.Millisecond, "app did not start serving")
+
+	return base, stop
+}
+
+func signalSelf(t *testing.T, sig os.Signal) {
+	t.Helper()
+
+	process, err := os.FindProcess(os.Getpid())
+	require.NoError(t, err)
+	require.NoError(t, process.Signal(sig))
+}
+
+// allowedAt is allowed for an app that is serving on the given address
+func allowedAt(t *testing.T, base string, domain string) bool {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, base+"/api/auth/traefik", nil)
+	require.NoError(t, err)
+
+	req.Header.Set("X-Forwarded-Host", domain)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Uri", "/")
+
+	res, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	res.Body.Close()
+
+	return res.StatusCode == http.StatusOK
+}
+
 func stopped(inst *instance) bool {
 	select {
 	case <-inst.ctx.Done():
@@ -109,6 +209,34 @@ func TestSetup(t *testing.T) {
 
 		require.ErrorContains(t, err, "app url")
 		assert.NoDirExists(t, filepath.Dir(config.Database.Path))
+	})
+
+	t.Run("reloads on SIGHUP and stops on SIGTERM", func(t *testing.T) {
+		config := newTestConfig(t)
+
+		reloaded := config
+		reloaded.Apps = map[string]model.App{
+			"bar": {
+				Config: model.AppConfig{Domain: "bar.example.com"},
+				Path:   model.AppPath{Allow: "/.*"},
+			},
+		}
+
+		base, stop := startApp(t, config, func() (model.Config, error) {
+			return reloaded, nil
+		})
+
+		require.True(t, allowedAt(t, base, "foo.example.com"))
+		require.False(t, allowedAt(t, base, "bar.example.com"))
+
+		signalSelf(t, syscall.SIGHUP)
+
+		require.Eventually(t, func() bool {
+			return allowedAt(t, base, "bar.example.com")
+		}, 5*time.Second, 20*time.Millisecond, "app did not reload")
+
+		assert.False(t, allowedAt(t, base, "foo.example.com"))
+		assert.NoError(t, stop())
 	})
 }
 
