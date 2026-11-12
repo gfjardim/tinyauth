@@ -253,6 +253,13 @@ func (app *BootstrapApp) reload() error {
 		return errors.New("failed to apply configuration: label provider is not available")
 	}
 
+	// the kubernetes provider loads its labels in the background. Served
+	// before it has them, the instance would not apply the rules they carry.
+	if err := inst.waitForLabels(app.ctx); err != nil {
+		inst.shutdown()
+		return fmt.Errorf("failed to apply configuration: failed to load the labels: %w", err)
+	}
+
 	// the instance is accepted, from here on the reload cannot fail
 	previous := app.setInstance(inst)
 	inst.reconcile()

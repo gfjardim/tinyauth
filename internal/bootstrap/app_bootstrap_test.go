@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -184,6 +185,108 @@ func allowedAt(t *testing.T, base string, domain string) bool {
 	res.Body.Close()
 
 	return res.StatusCode == http.StatusOK
+}
+
+// fakeKubernetes is the API of a cluster with one ingress, whose annotations
+// allow any path of foo.example.com. The listing that loads the labels can be
+// held back or made to fail.
+type fakeKubernetes struct {
+	mu   sync.Mutex
+	hold chan struct{}
+	fail bool
+}
+
+func (cluster *fakeKubernetes) set(hold chan struct{}, fail bool) {
+	cluster.mu.Lock()
+	defer cluster.mu.Unlock()
+	cluster.hold = hold
+	cluster.fail = fail
+}
+
+func (cluster *fakeKubernetes) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	const ingresses = `{"kind":"IngressList","apiVersion":"networking.k8s.io/v1","metadata":{"resourceVersion":"1"},"items":[` +
+		`{"kind":"Ingress","apiVersion":"networking.k8s.io/v1","metadata":{"name":"foo","namespace":"default","annotations":` +
+		`{"tinyauth.apps.foo.config.domain":"foo.example.com","tinyauth.apps.foo.path.allow":"/.*"}},` +
+		`"spec":{"rules":[{"host":"foo.example.com"}]}}]}`
+
+	failure := func(code int, reason string) {
+		w.WriteHeader(code)
+		fmt.Fprintf(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":%q,"code":%d}`, reason, code)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	query := r.URL.Query()
+
+	switch {
+	case r.URL.Path != "/apis/networking.k8s.io/v1/ingresses":
+		failure(http.StatusNotFound, "NotFound")
+	case query.Get("watch") != "":
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	case query.Get("limit") == "1":
+		// the probe the service makes before it starts watching
+		fmt.Fprint(w, ingresses)
+	default:
+		cluster.mu.Lock()
+		hold, fail := cluster.hold, cluster.fail
+		cluster.mu.Unlock()
+
+		if hold != nil {
+			select {
+			case <-hold:
+			case <-r.Context().Done():
+				return
+			}
+		}
+
+		if fail {
+			failure(http.StatusServiceUnavailable, "ServiceUnavailable")
+			return
+		}
+
+		fmt.Fprint(w, ingresses)
+	}
+}
+
+// useFakeKubernetes makes the kubernetes label provider talk to a fake cluster
+func useFakeKubernetes(t *testing.T) *fakeKubernetes {
+	t.Helper()
+
+	cluster := &fakeKubernetes{}
+	server := httptest.NewServer(cluster)
+
+	// the watches are still open when the test ends, closing has to end them
+	t.Cleanup(func() {
+		server.CloseClientConnections()
+		server.Close()
+	})
+
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+
+	require.NoError(t, os.WriteFile(kubeconfig, []byte(`apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: `+server.URL+`
+  name: fake
+contexts:
+- context:
+    cluster: fake
+    user: fake
+  name: fake
+current-context: fake
+users:
+- name: fake
+  user: {}
+`), 0600))
+
+	t.Setenv("KUBECONFIG", kubeconfig)
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+
+	return cluster
 }
 
 func stopped(inst *instance) bool {
@@ -448,6 +551,63 @@ func TestReload(t *testing.T) {
 		consents, err := app.queries.ListOIDCConsents(ctx)
 		require.NoError(t, err)
 		assert.Len(t, consents, 1)
+	})
+
+	t.Run("waits for the labels of the new instance", func(t *testing.T) {
+		app, config := newTestApp(t)
+		cluster := useFakeKubernetes(t)
+
+		// the only rule for foo.example.com is the one in the labels
+		config.Apps = nil
+		config.LabelProvider = "kubernetes"
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		require.NoError(t, app.reload())
+		require.True(t, allowed(app, "foo.example.com"))
+
+		// a reload while the cluster is slow to list its resources
+		previous := app.currentInstance()
+		hold := make(chan struct{})
+		cluster.set(hold, false)
+
+		reloaded := make(chan error, 1)
+
+		go func() {
+			reloaded <- app.reload()
+		}()
+
+		select {
+		case <-reloaded:
+			t.Fatal("reload did not wait for the labels")
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		assert.Same(t, previous, app.currentInstance())
+		assert.True(t, allowed(app, "foo.example.com"))
+
+		close(hold)
+
+		select {
+		case err := <-reloaded:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("reload did not finish once the labels were loaded")
+		}
+
+		assert.NotSame(t, previous, app.currentInstance())
+		assert.True(t, allowed(app, "foo.example.com"))
+
+		// a reload while the cluster fails to list its resources
+		previous = app.currentInstance()
+		cluster.set(nil, true)
+
+		require.ErrorContains(t, app.reload(), "failed to load the labels")
+
+		assert.Same(t, previous, app.currentInstance())
+		assert.True(t, allowed(app, "foo.example.com"))
 	})
 
 	t.Run("waits for the requests of the previous instance", func(t *testing.T) {
