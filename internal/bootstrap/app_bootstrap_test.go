@@ -429,6 +429,10 @@ func TestSetup(t *testing.T) {
 		t.Cleanup(docker.Close)
 		t.Setenv("DOCKER_HOST", "tcp://"+docker.Listener.Addr().String())
 
+		// the daemon above speaks plain HTTP, whatever the host is set up for
+		t.Setenv("DOCKER_CERT_PATH", "")
+		t.Setenv("DOCKER_TLS_VERIFY", "")
+
 		config.LabelProvider = "docker"
 		reloaded.LabelProvider = "docker"
 
