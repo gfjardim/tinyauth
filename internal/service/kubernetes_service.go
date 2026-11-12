@@ -123,6 +123,13 @@ type KubernetesService struct {
 	typedClient kubernetes.Interface
 	mu          sync.RWMutex
 	connected   bool
+
+	// first listing of the watched resources: how many are still to come, the
+	// error of one that failed, and the channel closed when all are over.
+	// The first two are guarded by mu.
+	pending int
+	syncErr error
+	synced  chan struct{}
 }
 
 type KubernetesServiceInput struct {
@@ -135,9 +142,10 @@ type KubernetesServiceInput struct {
 
 func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) {
 	service := &KubernetesService{
-		log:  i.Log,
-		apps: make(map[ResourceMeta]map[string]model.App),
-		ctx:  i.Ctx,
+		log:    i.Log,
+		apps:   make(map[ResourceMeta]map[string]model.App),
+		ctx:    i.Ctx,
+		synced: make(chan struct{}),
 	}
 
 	cfg, err := service.getConfig()
@@ -158,7 +166,7 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 	service.client = client
 	service.typedClient = typedClient
 
-	watchedGVRs := make(map[string]bool)
+	watched := make([]watchedResource, 0, len(supportedResources))
 
 	for _, res := range supportedResources {
 		ctx, cancel := context.WithTimeout(i.Ctx, 10*time.Second)
@@ -173,15 +181,21 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 
 		i.Log.App.Debug().Str("res", res.pretty()).Msg("Successfully accessed resource, starting watcher")
 
+		watched = append(watched, res)
+	}
+
+	if len(watched) == 0 {
+		return nil, fmt.Errorf("failed to access any supported kubernetes api (ingresses, httproutes, grpcroutes)")
+	}
+
+	// the watchers are started once all are known, so that the count of
+	// first listings to come is complete before any of them reports
+	service.pending = len(watched)
+
+	for _, res := range watched {
 		i.Ding.Go(func(ctx context.Context) {
 			service.watchGVR(res, ctx)
 		}, ding.RingMajor)
-
-		watchedGVRs[res.gvr.Resource] = true
-	}
-
-	if len(watchedGVRs) == 0 {
-		return nil, fmt.Errorf("failed to access any supported kubernetes api (ingresses, httproutes, grpcroutes)")
 	}
 
 	service.connected = true
@@ -367,7 +381,11 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 	resyncTicker := time.NewTicker(5 * time.Minute)
 	defer resyncTicker.Stop()
 
-	if err := k.resyncGVR(res, ctx); err != nil {
+	err := k.resyncGVR(res, ctx)
+
+	k.firstListingDone(err)
+
+	if err != nil {
 		k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Initial resync failed, will retry")
 		k.wait(ctx, 30*time.Second)
 	}
@@ -398,6 +416,38 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 			cancel()
 		}
 	}
+}
+
+// firstListingDone records how the first listing of a watched resource went
+func (k *KubernetesService) firstListingDone(err error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	if err != nil && k.syncErr == nil {
+		k.syncErr = err
+	}
+
+	k.pending--
+
+	if k.pending == 0 {
+		close(k.synced)
+	}
+}
+
+// WaitForSync waits until every watched resource has been listed once, which
+// is when the labels of the cluster are known, and returns the error of a
+// listing that failed
+func (k *KubernetesService) WaitForSync(ctx context.Context) error {
+	select {
+	case <-k.synced:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	return k.syncErr
 }
 
 func (k *KubernetesService) Lookup(locator func(name string, app *model.App)) error {
