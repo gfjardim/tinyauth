@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
+	"github.com/tinyauthapp/tinyauth/internal/repository"
 	"github.com/tinyauthapp/tinyauth/internal/repository/memory"
 	"github.com/tinyauthapp/tinyauth/internal/service"
 	"github.com/tinyauthapp/tinyauth/internal/test"
@@ -74,7 +75,7 @@ func newTestApp(t *testing.T) (*BootstrapApp, model.Config) {
 	require.NoError(t, err)
 
 	app.setInstance(inst)
-	inst.reconcile()
+	inst.reconcile(ctx)
 
 	t.Cleanup(func() {
 		cancel()
@@ -343,6 +344,24 @@ func holdRequest(t *testing.T, app *BootstrapApp) func() {
 	t.Cleanup(finish)
 
 	return finish
+}
+
+// stalledStore is a store that does not answer when its consents are listed,
+// as a database that is locked or cannot be reached
+type stalledStore struct {
+	repository.Store
+	asked chan struct{}
+}
+
+func (store *stalledStore) ListOIDCConsents(ctx context.Context) ([]repository.OidcConsent, error) {
+	select {
+	case store.asked <- struct{}{}:
+	default:
+	}
+
+	<-ctx.Done()
+
+	return nil, ctx.Err()
 }
 
 func stopped(inst *instance) bool {
@@ -913,6 +932,38 @@ func TestReloadOnShutdown(t *testing.T) {
 		}
 
 		assert.Same(t, previous, app.currentInstance())
+	})
+
+	t.Run("does not wait for a database that does not answer", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		// from here on the stored consents are never listed
+		store := &stalledStore{Store: app.queries, asked: make(chan struct{}, 1)}
+		app.queries = store
+
+		reloaded := make(chan error, 1)
+
+		go func() {
+			reloaded <- app.reload()
+		}()
+
+		select {
+		case <-store.asked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("reload did not get to the stored consents")
+		}
+
+		app.cancel()
+
+		select {
+		case <-reloaded:
+		case <-time.After(2 * time.Second):
+			t.Fatal("reload held the shutdown")
+		}
 	})
 
 	t.Run("ignores a signal that is still pending", func(t *testing.T) {

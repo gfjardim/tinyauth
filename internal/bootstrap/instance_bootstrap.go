@@ -124,10 +124,12 @@ func (app *instance) waitForLabels(ctx context.Context) error {
 
 // reconcile brings the stored data in line with the configuration of the
 // instance. An instance can still be rejected after it has been built, so this
-// is only to be called once the instance has been accepted.
-func (app *instance) reconcile() {
+// is only to be called once the instance has been accepted. It runs on the
+// given context and not on the one of the instance, which a shutdown only
+// cancels after the listener has stopped.
+func (app *instance) reconcile(ctx context.Context) {
 	if app.services.oidcService != nil {
-		app.services.oidcService.ReconcileConsents(app.ctx)
+		app.services.oidcService.ReconcileConsents(ctx)
 	}
 }
 

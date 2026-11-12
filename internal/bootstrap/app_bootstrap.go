@@ -151,7 +151,7 @@ func (app *BootstrapApp) Setup() error {
 	}
 
 	app.setInstance(inst)
-	inst.reconcile()
+	inst.reconcile(app.ctx)
 
 	app.ding.Go(func(ctx context.Context) {
 		<-ctx.Done()
@@ -266,7 +266,7 @@ func (app *BootstrapApp) reload() error {
 
 	// the instance is accepted, from here on the reload cannot fail
 	previous := app.setInstance(inst)
-	inst.reconcile()
+	inst.reconcile(app.ctx)
 	app.retire(previous)
 
 	if app.restartRequired(config) {
