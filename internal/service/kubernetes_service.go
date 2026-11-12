@@ -12,6 +12,7 @@ import (
 	"github.com/tinyauthapp/tinyauth/pkg/apis/tinyauth/v1alpha1"
 	"go.uber.org/dig"
 	networking "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -181,7 +182,16 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 		if err != nil {
 			// The CRD may not be available yet, so we'll fall back to ingress
 			i.Log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to access resource, skipping watcher")
-			service.firstListingDone(nil)
+
+			// a resource that the cluster does not have, or that the app may
+			// not read, has no labels to load. Any other failure is kept for
+			// whoever waits for the labels, which would otherwise take the
+			// labels for loaded while this resource is not even watched.
+			if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+				err = nil
+			}
+
+			service.firstListingDone(err)
 			continue
 		}
 
@@ -437,7 +447,7 @@ func (k *KubernetesService) firstListingDone(err error) {
 
 // WaitForSync waits until every watched resource has been listed once, which
 // is when the labels of the cluster are known, and returns the error of a
-// listing that failed
+// listing that failed or of a resource that could not be probed
 func (k *KubernetesService) WaitForSync(ctx context.Context) error {
 	select {
 	case <-k.synced:

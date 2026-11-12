@@ -812,6 +812,41 @@ func TestReload(t *testing.T) {
 		assert.True(t, allowed(app, "foo.example.com"))
 	})
 
+	t.Run("keeps the instance when a resource of the cluster cannot be probed", func(t *testing.T) {
+		app, config := newTestApp(t)
+		cluster := useFakeKubernetes(t)
+		cluster.setApplications(nil, 0)
+
+		// the only rules are the ones in the labels
+		config.Apps = nil
+		config.LabelProvider = "kubernetes"
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		require.NoError(t, app.reload())
+		require.True(t, allowed(app, "foo.example.com"))
+		require.True(t, allowed(app, "bar.example.com"))
+
+		// a reload while the cluster fails to answer for the applications
+		previous := app.currentInstance()
+		cluster.setApplications(nil, http.StatusServiceUnavailable)
+
+		require.ErrorContains(t, app.reload(), "failed to load the labels")
+
+		assert.Same(t, previous, app.currentInstance())
+		assert.True(t, allowed(app, "bar.example.com"))
+
+		// applications that the app may not read are left out, as when it starts
+		cluster.setApplications(nil, http.StatusForbidden)
+
+		require.NoError(t, app.reload())
+
+		assert.True(t, allowed(app, "foo.example.com"))
+		assert.False(t, allowed(app, "bar.example.com"))
+	})
+
 	t.Run("waits for the requests of the previous instance", func(t *testing.T) {
 		app, config := newTestApp(t)
 		previous := app.currentInstance()
