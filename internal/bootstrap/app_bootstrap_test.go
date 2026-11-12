@@ -346,7 +346,13 @@ func TestReloadRoutine(t *testing.T) {
 
 	// the first reload fails and the routine has to survive it
 	for range 2 {
-		sighup <- syscall.SIGHUP
+		select {
+		case sighup <- syscall.SIGHUP:
+		case <-done:
+			t.Fatal("routine stopped after a failed reload")
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not take the signal")
+		}
 
 		select {
 		case <-loads:
