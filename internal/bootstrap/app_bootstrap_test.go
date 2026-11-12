@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -108,6 +109,36 @@ func TestSetup(t *testing.T) {
 
 		require.ErrorContains(t, err, "app url")
 		assert.NoDirExists(t, filepath.Dir(config.Database.Path))
+	})
+}
+
+func TestNewInstance(t *testing.T) {
+	t.Run("stops building when the app is shut down", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		// nothing listens here, so the LDAP service keeps trying to connect
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		config.LDAP.Address = "ldap://" + listener.Addr().String()
+		require.NoError(t, listener.Close())
+
+		built := make(chan error, 1)
+
+		go func() {
+			_, err := app.newInstance(config)
+			built <- err
+		}()
+
+		// let the service start connecting
+		time.Sleep(200 * time.Millisecond)
+		app.cancel()
+
+		select {
+		case err := <-built:
+			assert.ErrorContains(t, err, "failed to connect to ldap server")
+		case <-time.After(2 * time.Second):
+			t.Fatal("instance kept building after the app was shut down")
+		}
 	})
 }
 

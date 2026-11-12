@@ -29,7 +29,7 @@ type instance struct {
 	services Services
 	log      *logger.Logger
 	ctx      context.Context
-	cancel   context.CancelFunc
+	cancel   context.CancelCauseFunc
 	queries  repository.Store
 	router   *gin.Engine
 	ding     *ding.Ding
@@ -61,9 +61,9 @@ func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
 // where an invalid configuration is found. It opens no connection and stores
 // nothing, so it can run before the database is set up.
 func (app *BootstrapApp) prepareInstance(config model.Config) (*instance, error) {
-	// the instance does not follow the app context, the app shuts it down
-	// once the listener has stopped
-	ctx, cancel := context.WithCancel(context.WithoutCancel(app.ctx))
+	// once it is built the instance does not follow the app context, the app
+	// shuts it down after the listener has stopped
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(app.ctx))
 
 	inst := &instance{
 		config: config,
@@ -90,7 +90,15 @@ func (app *BootstrapApp) startInstance(inst *instance) error {
 	inst.authCaches = app.authCaches
 	inst.oidcCaches = app.oidcCaches
 
+	// while it is being built the instance follows the app context, so that a
+	// shutdown does not have to wait for services that cannot connect
+	stop := context.AfterFunc(app.ctx, func() {
+		inst.cancel(context.Cause(app.ctx))
+	})
+
 	err := inst.setup()
+
+	stop()
 
 	if err != nil {
 		inst.shutdown()
@@ -115,7 +123,7 @@ func (app *instance) reconcile() {
 
 // shutdown stops the routines of the instance and waits for them to finish
 func (app *instance) shutdown() {
-	app.cancel()
+	app.cancel(nil)
 	app.ding.Wait()
 }
 
