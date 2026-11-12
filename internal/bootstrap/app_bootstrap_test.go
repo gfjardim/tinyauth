@@ -170,19 +170,26 @@ func signalSelf(t *testing.T, sig os.Signal) {
 	require.NoError(t, process.Signal(sig))
 }
 
-// allowedAt is allowed for an app that is serving on the given address
-func allowedAt(t *testing.T, base string, domain string) bool {
-	t.Helper()
-
+// allowedAt is allowed for an app that is serving on the given address. A
+// request that fails counts as not allowed: the waits call this from a routine
+// of their own, which must not fail the test and may still run when it is over.
+func allowedAt(base string, domain string) bool {
 	req, err := http.NewRequest(http.MethodGet, base+"/api/auth/traefik", nil)
-	require.NoError(t, err)
+
+	if err != nil {
+		return false
+	}
 
 	req.Header.Set("X-Forwarded-Host", domain)
 	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("X-Forwarded-Uri", "/")
 
 	res, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
+
+	if err != nil {
+		return false
+	}
+
 	res.Body.Close()
 
 	return res.StatusCode == http.StatusOK
@@ -379,16 +386,16 @@ func TestSetup(t *testing.T) {
 			return reloaded, nil
 		})
 
-		require.True(t, allowedAt(t, base, "foo.example.com"))
-		require.False(t, allowedAt(t, base, "bar.example.com"))
+		require.True(t, allowedAt(base, "foo.example.com"))
+		require.False(t, allowedAt(base, "bar.example.com"))
 
 		signalSelf(t, syscall.SIGHUP)
 
 		require.Eventually(t, func() bool {
-			return allowedAt(t, base, "bar.example.com")
+			return allowedAt(base, "bar.example.com")
 		}, 5*time.Second, 20*time.Millisecond, "app did not reload")
 
-		assert.False(t, allowedAt(t, base, "foo.example.com"))
+		assert.False(t, allowedAt(base, "foo.example.com"))
 		assert.NoError(t, stop())
 	})
 
@@ -441,7 +448,7 @@ func TestSetup(t *testing.T) {
 		})
 
 		require.Eventually(t, func() bool {
-			return allowedAt(t, base, "bar.example.com")
+			return allowedAt(base, "bar.example.com")
 		}, 5*time.Second, 20*time.Millisecond, "app did not reload")
 
 		assert.NoError(t, stop())
