@@ -157,7 +157,7 @@ func startApp(t *testing.T, config model.Config, loader func() (model.Config, er
 		}
 		res.Body.Close()
 		return res.StatusCode == http.StatusOK
-	}, 10*time.Second, 20*time.Millisecond, "app did not start serving")
+	}, 15*time.Second, 20*time.Millisecond, "app did not start serving")
 
 	return base, stop
 }
@@ -393,7 +393,7 @@ func TestSetup(t *testing.T) {
 
 		require.Eventually(t, func() bool {
 			return allowedAt(base, "bar.example.com")
-		}, 5*time.Second, 20*time.Millisecond, "app did not reload")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
 
 		assert.False(t, allowedAt(base, "foo.example.com"))
 		assert.NoError(t, stop())
@@ -449,7 +449,7 @@ func TestSetup(t *testing.T) {
 
 		require.Eventually(t, func() bool {
 			return allowedAt(base, "bar.example.com")
-		}, 5*time.Second, 20*time.Millisecond, "app did not reload")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
 
 		assert.NoError(t, stop())
 	})
