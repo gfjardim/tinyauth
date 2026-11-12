@@ -60,13 +60,17 @@ type BootstrapApp struct {
 	instance *instance
 	mu       sync.RWMutex
 
+	// how long an instance that was replaced may take to finish its requests
+	drainTimeout time.Duration
+
 	// loads the configuration again from its sources, nil disables reloading
 	configLoader func() (model.Config, error)
 }
 
 func NewBootstrapApp(config model.Config) *BootstrapApp {
 	return &BootstrapApp{
-		config: config,
+		config:       config,
+		drainTimeout: model.GracefulShutdownTimeout * time.Second,
 	}
 }
 
@@ -329,7 +333,7 @@ func (app *BootstrapApp) retire(inst *instance) {
 
 		select {
 		case <-served:
-		case <-time.After(model.GracefulShutdownTimeout * time.Second):
+		case <-time.After(app.drainTimeout):
 			app.log.App.Warn().Msg("Previous configuration is still serving requests, shutting its services down anyway")
 		case <-ctx.Done():
 		}
