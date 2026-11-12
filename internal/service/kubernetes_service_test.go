@@ -257,21 +257,29 @@ func TestKubernetesServiceRunWatcher(t *testing.T) {
 }
 
 func TestKubernetesServiceWatchGVRStopsWhileWaiting(t *testing.T) {
-	for _, verb := range []string{"list", "watch"} {
-		t.Run("to retry a failed "+verb, func(t *testing.T) {
+	for _, pause := range []string{"to retry a failed list", "to retry a failed watch", "to restart a closed watch"} {
+		t.Run(pause, func(t *testing.T) {
 			service := newKubernetesServiceForTest()
 			res := testResource(ResourceTypeIngress)
 			failed := make(chan struct{}, 1)
 			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{res.gvr: "IngressList"})
-			if verb == "list" {
+			switch pause {
+			case "to retry a failed list":
 				client.PrependReactor("list", "ingresses", func(ktesting.Action) (bool, runtime.Object, error) {
 					failed <- struct{}{}
 					return true, nil, errors.New("list failed")
 				})
-			} else {
+			case "to retry a failed watch":
 				client.PrependWatchReactor("ingresses", func(ktesting.Action) (bool, watch.Interface, error) {
 					failed <- struct{}{}
 					return true, nil, errors.New("watch failed")
+				})
+			case "to restart a closed watch":
+				client.PrependWatchReactor("ingresses", func(ktesting.Action) (bool, watch.Interface, error) {
+					closed := watch.NewFake()
+					closed.Stop()
+					failed <- struct{}{}
+					return true, closed, nil
 				})
 			}
 			service.client = client
@@ -286,7 +294,7 @@ func TestKubernetesServiceWatchGVRStopsWhileWaiting(t *testing.T) {
 			select {
 			case <-failed:
 			case <-time.After(time.Second):
-				t.Fatal(verb + " was not attempted")
+				t.Fatal("watcher did not get to the pause")
 			}
 			cancel()
 			select {
