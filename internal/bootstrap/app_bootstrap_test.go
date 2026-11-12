@@ -730,6 +730,64 @@ func TestNewInstance(t *testing.T) {
 			t.Fatal("routine was not stopped by the shutdown")
 		}
 	})
+
+	t.Run("keeps its routines when the app is shut down while it is built", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		// the bind holds the build until the server is told to answer
+		server := useFakeLDAP(t)
+		config.LDAP.Address = server.address
+
+		inst, err := app.prepareInstance(config)
+		require.NoError(t, err)
+
+		ended := make(chan struct{})
+
+		inst.ding.Go(func(ctx context.Context) {
+			<-ctx.Done()
+			close(ended)
+		}, ding.RingMajor)
+
+		started := make(chan error, 1)
+
+		go func() {
+			started <- app.startInstance(inst)
+		}()
+
+		select {
+		case <-server.asked:
+		case <-time.After(15 * time.Second):
+			t.Fatal("instance did not connect to the LDAP server")
+		}
+
+		app.cancel()
+
+		// the services that are still to be built add routines, which a
+		// ding that is stopping cannot take
+		select {
+		case <-ended:
+			t.Fatal("routine was stopped while the instance was still being built")
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		server.answer()
+
+		select {
+		case err := <-started:
+			// an instance that got built is stopped by whoever asked for it
+			if err == nil {
+				inst.shutdown()
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("build did not return")
+		}
+
+		select {
+		case <-ended:
+		default:
+			t.Fatal("routine was not stopped by the shutdown")
+		}
+	})
 }
 
 func TestKubernetesLabels(t *testing.T) {
