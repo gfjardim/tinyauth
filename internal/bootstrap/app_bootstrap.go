@@ -94,10 +94,18 @@ func (app *BootstrapApp) Setup() error {
 
 	app.log.App.Info().Msgf("Starting Tinyauth version: %s", model.Version)
 
+	// an invalid configuration is found here, before anything is created
+	inst, err := app.prepareInstance(app.config)
+
+	if err != nil {
+		return err
+	}
+
 	// database
 	store, err := app.SetupStore()
 
 	if err != nil {
+		inst.shutdown()
 		return fmt.Errorf("failed to setup database: %w", err)
 	}
 
@@ -121,7 +129,7 @@ func (app *BootstrapApp) Setup() error {
 	app.oidcCaches = service.NewOIDCCaches()
 
 	// build everything that depends on the configuration
-	inst, err := app.newInstance(app.config)
+	err = app.startInstance(inst)
 
 	if err != nil {
 		return err

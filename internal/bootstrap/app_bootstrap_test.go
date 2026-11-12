@@ -93,6 +93,24 @@ func stopped(inst *instance) bool {
 	}
 }
 
+func TestSetup(t *testing.T) {
+	t.Run("rejects an invalid configuration before the database is created", func(t *testing.T) {
+		config, _ := test.CreateTestConfigs(t)
+
+		config.AppURL = "invalid"
+		config.Log.Level = "disabled"
+		config.Database.Driver = "sqlite"
+		config.Database.Path = filepath.Join(t.TempDir(), "data", "tinyauth.db")
+
+		app := NewBootstrapApp(config)
+		err := app.Setup()
+		t.Cleanup(app.cancel)
+
+		require.ErrorContains(t, err, "app url")
+		assert.NoDirExists(t, filepath.Dir(config.Database.Path))
+	})
+}
+
 func TestReload(t *testing.T) {
 	t.Run("serves the new configuration and stops the previous instance", func(t *testing.T) {
 		app, config := newTestApp(t)

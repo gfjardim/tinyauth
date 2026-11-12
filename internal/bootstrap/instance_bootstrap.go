@@ -42,25 +42,39 @@ type instance struct {
 	requests sync.WaitGroup
 }
 
+// newInstance prepares an instance for the configuration and starts it
 func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
+	inst, err := app.prepareInstance(config)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := app.startInstance(inst); err != nil {
+		return nil, err
+	}
+
+	return inst, nil
+}
+
+// prepareInstance creates an instance and derives its runtime config, which is
+// where an invalid configuration is found. It opens no connection and stores
+// nothing, so it can run before the database is set up.
+func (app *BootstrapApp) prepareInstance(config model.Config) (*instance, error) {
 	// the instance does not follow the app context, the app shuts it down
 	// once the listener has stopped
 	ctx, cancel := context.WithCancel(context.WithoutCancel(app.ctx))
 
 	inst := &instance{
-		config:  config,
-		log:     app.log,
-		ctx:     ctx,
-		cancel:  cancel,
-		queries: app.queries,
-		ding:    ding.New(ctx),
-		dig:     dig.New(),
-
-		authCaches: app.authCaches,
-		oidcCaches: app.oidcCaches,
+		config: config,
+		log:    app.log,
+		ctx:    ctx,
+		cancel: cancel,
+		ding:   ding.New(ctx),
+		dig:    dig.New(),
 	}
 
-	err := inst.setup()
+	err := inst.setupRuntime()
 
 	if err != nil {
 		inst.shutdown()
@@ -68,6 +82,22 @@ func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
 	}
 
 	return inst, nil
+}
+
+// startInstance builds the services and the router of a prepared instance
+func (app *BootstrapApp) startInstance(inst *instance) error {
+	inst.queries = app.queries
+	inst.authCaches = app.authCaches
+	inst.oidcCaches = app.oidcCaches
+
+	err := inst.setup()
+
+	if err != nil {
+		inst.shutdown()
+		return err
+	}
+
+	return nil
 }
 
 func (app *instance) hasLabelProvider() bool {
@@ -90,13 +120,6 @@ func (app *instance) shutdown() {
 }
 
 func (app *instance) setup() error {
-	// runtime config
-	err := app.setupRuntime()
-
-	if err != nil {
-		return err
-	}
-
 	// provide basic utilities to container
 	type utilityProvider struct {
 		dig.Out
@@ -112,7 +135,7 @@ func (app *instance) setup() error {
 		OIDCCaches *service.OIDCCaches
 	}
 
-	err = app.dig.Provide(func() utilityProvider {
+	err := app.dig.Provide(func() utilityProvider {
 		return utilityProvider{
 			Log:     app.log,
 			Config:  &app.config,
