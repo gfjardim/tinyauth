@@ -253,6 +253,48 @@ func TestKubernetesServiceRunWatcher(t *testing.T) {
 	}
 }
 
+func TestKubernetesServiceWatchGVRStopsWhileWaiting(t *testing.T) {
+	for _, verb := range []string{"list", "watch"} {
+		t.Run("to retry a failed "+verb, func(t *testing.T) {
+			service := newKubernetesServiceForTest()
+			res := testResource(ResourceTypeIngress)
+			failed := make(chan struct{}, 1)
+			client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{res.gvr: "IngressList"})
+			if verb == "list" {
+				client.PrependReactor("list", "ingresses", func(ktesting.Action) (bool, runtime.Object, error) {
+					failed <- struct{}{}
+					return true, nil, errors.New("list failed")
+				})
+			} else {
+				client.PrependWatchReactor("ingresses", func(ktesting.Action) (bool, watch.Interface, error) {
+					failed <- struct{}{}
+					return true, nil, errors.New("watch failed")
+				})
+			}
+			service.client = client
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				service.watchGVR(res, ctx)
+				close(done)
+			}()
+
+			select {
+			case <-failed:
+			case <-time.After(time.Second):
+				t.Fatal(verb + " was not attempted")
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("watcher kept waiting after cancellation")
+			}
+		})
+	}
+}
+
 func TestKubernetesServiceLookup(t *testing.T) {
 	for _, tt := range []struct {
 		name      string

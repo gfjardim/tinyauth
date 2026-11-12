@@ -315,6 +315,20 @@ func (k *KubernetesService) resyncGVR(res watchedResource, ctx context.Context) 
 	return nil
 }
 
+// wait pauses before a retry and reports whether the pause ran to its end,
+// false meaning the context was cancelled meanwhile
+func (k *KubernetesService) wait(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (k *KubernetesService) runWatcher(res watchedResource, w watch.Interface, resyncTicker *time.Ticker, ctx context.Context) bool {
 	for {
 		select {
@@ -325,8 +339,7 @@ func (k *KubernetesService) runWatcher(res watchedResource, w watch.Interface, r
 			if !ok {
 				k.log.App.Warn().Str("res", res.pretty()).Msg("Watcher channel closed, restarting watcher")
 				w.Stop()
-				time.Sleep(5 * time.Second)
-				return true
+				return k.wait(ctx, 5*time.Second)
 			}
 			item, ok := event.Object.(*unstructured.Unstructured)
 			if !ok {
@@ -356,7 +369,7 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 
 	if err := k.resyncGVR(res, ctx); err != nil {
 		k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Initial resync failed, will retry")
-		time.Sleep(30 * time.Second)
+		k.wait(ctx, 30*time.Second)
 	}
 
 	for {
@@ -369,16 +382,16 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 				k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Periodic resync failed, will retry")
 			}
 		default:
-			ctx, cancel := context.WithCancel(ctx)
-			watcher, err := k.client.Resource(res.gvr).Watch(ctx, metav1.ListOptions{})
+			watchCtx, cancel := context.WithCancel(ctx)
+			watcher, err := k.client.Resource(res.gvr).Watch(watchCtx, metav1.ListOptions{})
 			if err != nil {
 				k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to start watcher, will retry")
 				cancel()
-				time.Sleep(10 * time.Second)
+				k.wait(ctx, 10*time.Second)
 				continue
 			}
 			k.log.App.Debug().Str("res", res.pretty()).Msg("Watcher started successfully")
-			if !k.runWatcher(res, watcher, resyncTicker, ctx) {
+			if !k.runWatcher(res, watcher, resyncTicker, watchCtx) {
 				cancel()
 				return
 			}
