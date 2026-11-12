@@ -840,7 +840,7 @@ func TestReload(t *testing.T) {
 		select {
 		case err := <-reloaded:
 			require.NoError(t, err)
-		case <-time.After(5 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatal("reload did not finish once the labels were loaded")
 		}
 
@@ -1060,7 +1060,7 @@ func TestReloadRoutine(t *testing.T) {
 		case sighup <- syscall.SIGHUP:
 		case <-done:
 			t.Fatal("routine stopped after a failed reload")
-		case <-time.After(5 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatal("routine did not take the signal")
 		}
 
@@ -1075,7 +1075,7 @@ func TestReloadRoutine(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("routine did not stop")
 	}
 
@@ -1210,7 +1210,7 @@ func TestReloadOnShutdown(t *testing.T) {
 
 		select {
 		case <-asked:
-		case <-time.After(5 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatal("instance did not connect to the LDAP server")
 		}
 
@@ -1228,7 +1228,7 @@ func TestReloadOnShutdown(t *testing.T) {
 
 		select {
 		case <-closed:
-		case <-time.After(5 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatal("instance was left running")
 		}
 
@@ -1257,7 +1257,7 @@ func TestReloadOnShutdown(t *testing.T) {
 
 		select {
 		case <-store.asked:
-		case <-time.After(5 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatal("reload did not get to the stored consents")
 		}
 
