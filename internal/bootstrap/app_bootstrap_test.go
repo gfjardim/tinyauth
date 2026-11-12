@@ -164,12 +164,21 @@ func startApp(t *testing.T, config model.Config, loader func() (model.Config, er
 	return base, stop
 }
 
+// sendSelf sends a signal to the process of the test
+func sendSelf(sig os.Signal) error {
+	process, err := os.FindProcess(os.Getpid())
+
+	if err != nil {
+		return err
+	}
+
+	return process.Signal(sig)
+}
+
 func signalSelf(t *testing.T, sig os.Signal) {
 	t.Helper()
 
-	process, err := os.FindProcess(os.Getpid())
-	require.NoError(t, err)
-	require.NoError(t, process.Signal(sig))
+	require.NoError(t, sendSelf(sig))
 }
 
 // allowedAt is allowed for an app that is serving on the given address. A
@@ -511,7 +520,9 @@ func TestSetup(t *testing.T) {
 
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/_ping"):
-				once.Do(func() { signalSelf(t, syscall.SIGHUP) })
+				// a handler may not fail the test. A signal that was not
+				// sent shows as the reload that does not come.
+				once.Do(func() { _ = sendSelf(syscall.SIGHUP) })
 				_, _ = w.Write([]byte("OK"))
 			case strings.HasSuffix(r.URL.Path, "/containers/json"):
 				_, _ = w.Write([]byte("[]"))
