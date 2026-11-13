@@ -16,6 +16,7 @@ import (
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/repository"
+	"github.com/tinyauthapp/tinyauth/internal/service"
 	"github.com/tinyauthapp/tinyauth/internal/utils"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 )
@@ -36,6 +37,9 @@ type instance struct {
 
 	// stops the routines in the ding, which have a context of their own
 	stopRoutines context.CancelFunc
+
+	authCaches *service.AuthCaches
+	oidcCaches *service.OIDCCaches
 
 	// requests being served by this instance
 	requests sync.WaitGroup
@@ -78,6 +82,8 @@ func (app *BootstrapApp) prepareInstance(config model.Config) (*instance, error)
 // startInstance builds the services and the router of a prepared instance
 func (app *BootstrapApp) startInstance(inst *instance) error {
 	inst.queries = app.queries
+	inst.authCaches = app.authCaches
+	inst.oidcCaches = app.oidcCaches
 
 	// while it is being built the instance follows the app context, so that a
 	// shutdown does not have to wait for services that cannot connect
@@ -115,6 +121,9 @@ func (app *instance) setup() error {
 		Ding    *ding.Ding
 		Ctx     context.Context
 		Queries repository.Store
+
+		AuthCaches *service.AuthCaches
+		OIDCCaches *service.OIDCCaches
 	}
 
 	err := app.dig.Provide(func() utilityProvider {
@@ -125,6 +134,9 @@ func (app *instance) setup() error {
 			Ding:    app.ding,
 			Ctx:     app.ctx,
 			Queries: app.queries,
+
+			AuthCaches: app.authCaches,
+			OIDCCaches: app.oidcCaches,
 		}
 	})
 

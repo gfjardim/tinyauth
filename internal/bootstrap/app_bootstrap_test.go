@@ -14,6 +14,7 @@ import (
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/repository/memory"
+	"github.com/tinyauthapp/tinyauth/internal/service"
 	"github.com/tinyauthapp/tinyauth/internal/test"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 )
@@ -56,6 +57,8 @@ func newTestApp(t *testing.T) (*BootstrapApp, model.Config) {
 	app.log = log
 	app.queries = memory.New()
 	app.ding = ding.New(ctx)
+	app.authCaches = service.NewAuthCaches()
+	app.oidcCaches = service.NewOIDCCaches()
 
 	inst, err := app.prepareInstance(config)
 	require.NoError(t, err)

@@ -51,6 +51,10 @@ type BootstrapApp struct {
 	db      *sql.DB
 	ding    *ding.Ding
 
+	// in-memory state of the services that outlives an instance
+	authCaches *service.AuthCaches
+	oidcCaches *service.OIDCCaches
+
 	// instance serving the requests, guarded by mu
 	instance *instance
 	mu       sync.RWMutex
@@ -108,6 +112,10 @@ func (app *BootstrapApp) Setup() error {
 
 	// store
 	app.queries = store
+
+	// state that outlives an instance
+	app.authCaches = service.NewAuthCaches()
+	app.oidcCaches = service.NewOIDCCaches()
 
 	// build everything that depends on the configuration
 	err = app.startInstance(inst)
