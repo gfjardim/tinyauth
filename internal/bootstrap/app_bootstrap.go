@@ -243,7 +243,7 @@ func (app *BootstrapApp) reload() error {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	inst, err := app.newInstance(config)
+	inst, err := app.newInstanceUntilShutdown(config)
 
 	if err != nil {
 		return fmt.Errorf("failed to apply configuration: %w", err)
@@ -259,6 +259,42 @@ func (app *BootstrapApp) reload() error {
 	}
 
 	return nil
+}
+
+// newInstanceUntilShutdown builds an instance, but gives up when the app is
+// shut down meanwhile. A shutdown interrupts the services that follow their
+// context, the others would hold it until they are done connecting.
+func (app *BootstrapApp) newInstanceUntilShutdown(config model.Config) (*instance, error) {
+	type result struct {
+		inst *instance
+		err  error
+	}
+
+	built := make(chan result, 1)
+
+	go func() {
+		inst, err := app.newInstance(config)
+		built <- result{inst, err}
+	}()
+
+	select {
+	case res := <-built:
+		if res.err == nil && app.ctx.Err() != nil {
+			res.inst.shutdown()
+			return nil, context.Cause(app.ctx)
+		}
+
+		return res.inst, res.err
+	case <-app.ctx.Done():
+		// whatever is still connecting is stopped once it returns
+		go func() {
+			if res := <-built; res.err == nil {
+				res.inst.shutdown()
+			}
+		}()
+
+		return nil, context.Cause(app.ctx)
+	}
 }
 
 // restartRequired reports whether the given configuration changes something
@@ -295,9 +331,22 @@ func (app *BootstrapApp) reloadRoutine(ctx context.Context, sighup <-chan os.Sig
 	for {
 		select {
 		case <-sighup:
+			// a signal that arrives with the shutdown. The context of the
+			// app is looked at because the one of the routine is only
+			// cancelled a moment later.
+			if app.ctx.Err() != nil {
+				continue
+			}
+
 			app.log.App.Info().Msg("Received SIGHUP, reloading configuration")
 
 			if err := app.reload(); err != nil {
+				// a reload that the shutdown interrupted was not refused
+				if app.ctx.Err() != nil {
+					app.log.App.Debug().Err(err).Msg("Configuration reload interrupted by the shutdown")
+					continue
+				}
+
 				app.log.App.Error().Err(err).Msg("Failed to reload configuration, keeping the previous one")
 				continue
 			}

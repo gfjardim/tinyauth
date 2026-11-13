@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -162,12 +163,14 @@ func startApp(t *testing.T, config model.Config, loader func() (model.Config, er
 	return base, stop
 }
 
-// fakeLDAP is an LDAP server that only answers the bind when it is told to
-// and finds nothing in a search
+// fakeLDAP is an LDAP server that only answers the bind when it is told to,
+// finds nothing in a search and reports when the app closes the connection
 type fakeLDAP struct {
 	address string
 	// closed when the bind has arrived
 	asked chan struct{}
+	// closed when the app has closed the connection
+	closed chan struct{}
 	// lets the server answer the bind
 	answer func()
 }
@@ -186,6 +189,7 @@ func useFakeLDAP(t *testing.T) *fakeLDAP {
 	server := &fakeLDAP{
 		address: "ldap://" + listener.Addr().String(),
 		asked:   make(chan struct{}),
+		closed:  make(chan struct{}),
 		answer:  func() { release.Do(func() { close(hold) }) },
 	}
 
@@ -216,6 +220,7 @@ func useFakeLDAP(t *testing.T) *fakeLDAP {
 			read, err := conn.Read(buffer)
 
 			if err != nil {
+				close(server.closed)
 				return
 			}
 
@@ -227,6 +232,24 @@ func useFakeLDAP(t *testing.T) *fakeLDAP {
 	}()
 
 	return server
+}
+
+// syncBuffer collects what the logger writes, which comes from several routines
+type syncBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
 }
 
 // sendSelf sends a signal to the process of the test
@@ -817,6 +840,11 @@ func TestReload(t *testing.T) {
 func TestReloadRoutine(t *testing.T) {
 	app, config := newTestApp(t)
 
+	output := &syncBuffer{}
+	log := logger.NewLogger().WithTestConfig().WithWriter(output)
+	log.Init()
+	app.log = log
+
 	reloaded := config
 	reloaded.Apps = map[string]model.App{
 		"bar": {
@@ -874,9 +902,112 @@ func TestReloadRoutine(t *testing.T) {
 	// the routine has returned, so the second reload is done
 	assert.False(t, allowed(app, "foo.example.com"))
 	assert.True(t, allowed(app, "bar.example.com"))
+
+	// the first one was reported
+	assert.Contains(t, output.String(), "Failed to reload configuration")
 }
 
 func TestReloadOnShutdown(t *testing.T) {
+	t.Run("does not wait for an instance that is still connecting", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		// an LDAP server that accepts the connection and never answers, which
+		// the LDAP client waits for whatever happens to its context
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		accepted := make(chan net.Conn, 16)
+
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					close(accepted)
+					return
+				}
+				accepted <- conn
+			}
+		}()
+
+		t.Cleanup(func() {
+			listener.Close()
+			for conn := range accepted {
+				conn.Close()
+			}
+		})
+
+		config.LDAP.Address = "ldap://" + listener.Addr().String()
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		previous := app.currentInstance()
+		reloaded := make(chan error, 1)
+
+		go func() {
+			reloaded <- app.reload()
+		}()
+
+		// let the service connect
+		time.Sleep(200 * time.Millisecond)
+		app.cancel()
+
+		select {
+		case err := <-reloaded:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("reload held the shutdown")
+		}
+
+		assert.Same(t, previous, app.currentInstance())
+	})
+
+	t.Run("stops an instance that gets ready after the reload gave up", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		// the bind holds the build until the server is told to answer
+		server := useFakeLDAP(t)
+		config.LDAP.Address = server.address
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		previous := app.currentInstance()
+		reloaded := make(chan error, 1)
+
+		go func() {
+			reloaded <- app.reload()
+		}()
+
+		select {
+		case <-server.asked:
+		case <-time.After(15 * time.Second):
+			t.Fatal("instance did not connect to the LDAP server")
+		}
+
+		app.cancel()
+
+		select {
+		case err := <-reloaded:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(2 * time.Second):
+			t.Fatal("reload held the shutdown")
+		}
+
+		// the instance is now built without anyone waiting for it
+		server.answer()
+
+		select {
+		case <-server.closed:
+		case <-time.After(15 * time.Second):
+			t.Fatal("instance was left running")
+		}
+
+		assert.Same(t, previous, app.currentInstance())
+	})
+
 	t.Run("does not wait for a database that does not answer", func(t *testing.T) {
 		app, config := newTestApp(t)
 
@@ -910,6 +1041,87 @@ func TestReloadOnShutdown(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("reload held the shutdown")
 		}
+	})
+
+	t.Run("ignores a signal that arrives with the shutdown", func(t *testing.T) {
+		app, config := newTestApp(t)
+		loads := 0
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			loads++
+			return config, nil
+		})
+
+		// the context of the app is cancelled first, the one of the routine
+		// only once the app gets to stopping it
+		app.cancel()
+
+		ctx, stop := context.WithCancel(context.Background())
+		sighup := make(chan os.Signal)
+		done := make(chan struct{})
+
+		go func() {
+			app.reloadRoutine(ctx, sighup)
+			close(done)
+		}()
+
+		select {
+		case sighup <- syscall.SIGHUP:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not take the signal")
+		}
+
+		stop()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not stop")
+		}
+
+		assert.Zero(t, loads)
+	})
+
+	t.Run("does not report a reload that the shutdown interrupted as failed", func(t *testing.T) {
+		app, config := newTestApp(t)
+
+		output := &syncBuffer{}
+		log := logger.NewLogger().WithTestConfig().WithWriter(output)
+		log.Init()
+		app.log = log
+
+		// the shutdown arrives behind the signal, once the routine has
+		// taken it and is loading the configuration
+		app.WithConfigLoader(func() (model.Config, error) {
+			app.cancel()
+			return config, nil
+		})
+
+		ctx, stop := context.WithCancel(context.Background())
+		sighup := make(chan os.Signal)
+		done := make(chan struct{})
+
+		go func() {
+			app.reloadRoutine(ctx, sighup)
+			close(done)
+		}()
+
+		select {
+		case sighup <- syscall.SIGHUP:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not take the signal")
+		}
+
+		stop()
+
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("routine did not stop")
+		}
+
+		assert.Contains(t, output.String(), "Received SIGHUP, reloading configuration")
+		assert.NotContains(t, output.String(), "Failed to reload configuration")
 	})
 }
 
