@@ -146,6 +146,30 @@ func main() {
 	}
 }
 
+// loadConfig builds the configuration from scratch with the given loaders and validates it
+func loadConfig(args []string, resources []cli.ResourceLoader) (model.Config, error) {
+	cfg := model.NewDefaultConfiguration(model.DetectRuntimeEnv())
+	cmd := &cli.Command{Configuration: cfg}
+
+	for _, resource := range resources {
+		done, err := resource.Load(args, cmd)
+		if err != nil {
+			return model.Config{}, err
+		}
+		if done {
+			break
+		}
+	}
+
+	res := cfg.Validate()
+
+	if len(res.Errors) > 0 {
+		return model.Config{}, fmt.Errorf("invalid configuration: %s", strings.Join(res.Errors, ", "))
+	}
+
+	return *cfg, nil
+}
+
 func runCmd(cfg model.Config) error {
 	app := bootstrap.NewBootstrapApp(cfg)
 
