@@ -370,11 +370,6 @@ func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
 		issuer:     issuer,
 	}
 
-	// Remove consents for clients that are no longer configured
-	if err := service.reconcileOIDCConsents(context.Background()); err != nil {
-		i.Log.App.Warn().Err(err).Msg("Failed to reconcile OIDC consents")
-	}
-
 	// Start cleanup routine
 	i.Ding.Go(service.cleanupRoutine, ding.RingMinor)
 
@@ -1079,6 +1074,16 @@ func (service *OIDCService) UpsertOIDCConsent(ctx context.Context, username, sco
 	}
 
 	return consent, nil
+}
+
+// ReconcileConsents removes the consents of clients that are no longer configured
+func (service *OIDCService) ReconcileConsents(ctx context.Context) {
+	service.mus.consent.Lock()
+	defer service.mus.consent.Unlock()
+
+	if err := service.reconcileOIDCConsents(ctx); err != nil {
+		service.log.App.Warn().Err(err).Msg("Failed to reconcile OIDC consents")
+	}
 }
 
 func (service *OIDCService) reconcileOIDCConsents(ctx context.Context) error {

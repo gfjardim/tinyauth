@@ -125,6 +125,7 @@ func (app *BootstrapApp) Setup() error {
 	}
 
 	app.setInstance(inst)
+	inst.reconcile(app.ctx)
 
 	app.ding.Go(func(ctx context.Context) {
 		<-ctx.Done()

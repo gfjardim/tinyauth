@@ -65,6 +65,7 @@ func newTestApp(t *testing.T) (*BootstrapApp, model.Config) {
 	require.NoError(t, app.startInstance(inst))
 
 	app.setInstance(inst)
+	inst.reconcile(ctx)
 
 	t.Cleanup(func() {
 		cancel()

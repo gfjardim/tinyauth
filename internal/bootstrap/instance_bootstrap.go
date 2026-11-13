@@ -103,6 +103,17 @@ func (app *BootstrapApp) startInstance(inst *instance) error {
 	return nil
 }
 
+// reconcile brings the stored data in line with the configuration of the
+// instance. An instance can still be rejected after it has been built, so this
+// is only to be called once the instance has been accepted. It runs on the
+// given context and not on the one of the instance, which a shutdown only
+// cancels after the listener has stopped.
+func (app *instance) reconcile(ctx context.Context) {
+	if app.services.oidcService != nil {
+		app.services.oidcService.ReconcileConsents(ctx)
+	}
+}
+
 // shutdown stops the routines of the instance and waits for them to finish
 func (app *instance) shutdown() {
 	app.cancel(nil)
