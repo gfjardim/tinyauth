@@ -160,6 +160,22 @@ type UsedCodeEntry struct {
 	Sub string
 }
 
+// OIDCCaches holds the in-memory state of the OIDC service that can outlive
+// it, such as when the service is rebuilt from a new configuration
+type OIDCCaches struct {
+	Code      *cache.CacheStore[AuthorizeCodeEntry]
+	UsedCode  *cache.CacheStore[UsedCodeEntry]
+	Authorize *cache.CacheStore[AuthorizeRequest]
+}
+
+func NewOIDCCaches() *OIDCCaches {
+	return &OIDCCaches{
+		Code:      cache.NewCacheStore[AuthorizeCodeEntry](256),
+		UsedCode:  cache.NewCacheStore[UsedCodeEntry](256),
+		Authorize: cache.NewCacheStore[AuthorizeRequest](256),
+	}
+}
+
 type OIDCService struct {
 	log     *logger.Logger
 	config  *model.Config
@@ -190,6 +206,7 @@ type OIDCServiceInput struct {
 	Runtime *model.RuntimeConfig
 	Queries repository.Store
 	Ding    *ding.Ding
+	Caches  *OIDCCaches `optional:"true"`
 }
 
 func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
@@ -362,13 +379,15 @@ func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
 	i.Ding.Go(service.cleanupRoutine, ding.RingMinor)
 
 	// Create caches
-	codeCache := cache.NewCacheStore[AuthorizeCodeEntry](256)
-	usedCode := cache.NewCacheStore[UsedCodeEntry](256)
-	authorize := cache.NewCacheStore[AuthorizeRequest](256)
+	caches := i.Caches
 
-	service.caches.code = codeCache
-	service.caches.usedCode = usedCode
-	service.caches.authorize = authorize
+	if caches == nil {
+		caches = NewOIDCCaches()
+	}
+
+	service.caches.code = caches.Code
+	service.caches.usedCode = caches.UsedCode
+	service.caches.authorize = caches.Authorize
 
 	// Start cache cleanup routine
 	i.Ding.Go(func(ctx context.Context) {
