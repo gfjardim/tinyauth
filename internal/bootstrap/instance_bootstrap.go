@@ -122,6 +122,16 @@ func (app *instance) hasLabelProvider() bool {
 	return app.services.dockerService != nil || app.services.kubernetesService != nil
 }
 
+// waitForLabels waits for a label provider that loads its labels in the
+// background. The docker provider has them as soon as it is built.
+func (app *instance) waitForLabels(ctx context.Context) error {
+	if app.services.kubernetesService == nil {
+		return nil
+	}
+
+	return app.services.kubernetesService.WaitForSync(ctx)
+}
+
 // reconcile brings the stored data in line with the configuration of the
 // instance. An instance can still be rejected after it has been built, so this
 // is only to be called once the instance has been accepted. It runs on the
