@@ -87,98 +87,12 @@ func (app *BootstrapApp) Setup() error {
 
 	app.log.App.Info().Msgf("Starting Tinyauth version: %s", model.Version)
 
-	// get app url
-	appURL, err := utils.SafeParseAppURL(app.config.AppURL)
+	// runtime config
+	err := app.setupRuntime()
 
 	if err != nil {
-		return fmt.Errorf("failed to parse app url: %w", err)
+		return err
 	}
-
-	app.runtime.AppURL = appURL
-
-	// validate session config
-	if app.config.Auth.SessionMaxLifetime != 0 && app.config.Auth.SessionMaxLifetime < app.config.Auth.SessionExpiry {
-		return errors.New("session max lifetime cannot be less than session expiry")
-	}
-
-	// parse users
-	users, err := utils.GetUsers(app.config.Auth.Users, app.config.Auth.UsersFile, app.config.Auth.UserAttributes)
-
-	if err != nil {
-		return fmt.Errorf("failed to load users: %w", err)
-	}
-
-	if users != nil {
-		app.runtime.LocalUsers = *users
-	} else {
-		log.App.Debug().Msg("No local users found, local authentication will not be available")
-		app.runtime.LocalUsers = []model.LocalUser{}
-	}
-
-	// load oauth whitelist
-	oauthWhitelist, err := utils.GetStringList(app.config.OAuth.Whitelist, app.config.OAuth.WhitelistFile)
-
-	if err != nil {
-		return fmt.Errorf("failed to load oauth whitelist: %w", err)
-	}
-
-	app.runtime.OAuthWhitelist = oauthWhitelist
-
-	// setup oauth providers
-	app.runtime.OAuthProviders = app.config.OAuth.Providers
-
-	for id, provider := range app.runtime.OAuthProviders {
-		if slices.Contains(model.ReservedProviderNames, id) {
-			return fmt.Errorf("provider id %s is reserved and cannot be used", id)
-		}
-
-		providerWhitelist, err := utils.GetStringList(provider.Whitelist, provider.WhitelistFile)
-		if err != nil {
-			return fmt.Errorf("failed to load oauth whitelist for provider %s: %w", id, err)
-		}
-
-		provider.Whitelist = providerWhitelist
-
-		secret := utils.GetSecret(provider.ClientSecret, provider.ClientSecretFile)
-		provider.ClientSecret = secret
-		provider.ClientSecretFile = ""
-
-		if provider.Name == "" {
-			if name, ok := model.OverrideProviders[id]; ok {
-				provider.Name = name
-			} else {
-				provider.Name = utils.Capitalize(id)
-			}
-		}
-
-		if provider.RedirectURL == "" {
-			provider.RedirectURL = app.runtime.AppURL + "/api/oauth/callback/" + id
-		}
-
-		app.runtime.OAuthProviders[id] = provider
-	}
-
-	cookieDomain, err := utils.GetCookieDomain(app.runtime.AppURL, app.config.Auth.SubdomainsEnabled)
-
-	if err != nil {
-		return fmt.Errorf("failed to get cookie domain: %w", err)
-	}
-
-	app.runtime.CookieDomain = cookieDomain
-
-	// cookie names
-	u, err := url.Parse(app.runtime.AppURL)
-
-	if err != nil {
-		return fmt.Errorf("failed to parse app url: %w", err)
-	}
-
-	app.runtime.UUID = utils.GenerateUUID(u.Hostname())
-
-	cookieId := strings.Split(app.runtime.UUID, "-")[0] // first 8 characters of the uuid should be good enough
-
-	app.runtime.SessionCookieName = fmt.Sprintf("%s-%s", model.SessionCookieName, cookieId)
-	app.runtime.OAuthSessionCookieName = fmt.Sprintf("%s-%s", model.OAuthSessionCookieName, cookieId)
 
 	// database
 	store, err := app.SetupStore()
@@ -321,6 +235,104 @@ func (app *BootstrapApp) Setup() error {
 			}
 		}
 	}
+}
+
+// setupRuntime fills the runtime config with the values derived from the config
+func (app *BootstrapApp) setupRuntime() error {
+	// get app url
+	appURL, err := utils.SafeParseAppURL(app.config.AppURL)
+
+	if err != nil {
+		return fmt.Errorf("failed to parse app url: %w", err)
+	}
+
+	app.runtime.AppURL = appURL
+
+	// validate session config
+	if app.config.Auth.SessionMaxLifetime != 0 && app.config.Auth.SessionMaxLifetime < app.config.Auth.SessionExpiry {
+		return errors.New("session max lifetime cannot be less than session expiry")
+	}
+
+	// parse users
+	users, err := utils.GetUsers(app.config.Auth.Users, app.config.Auth.UsersFile, app.config.Auth.UserAttributes)
+
+	if err != nil {
+		return fmt.Errorf("failed to load users: %w", err)
+	}
+
+	if users != nil {
+		app.runtime.LocalUsers = *users
+	} else {
+		app.log.App.Debug().Msg("No local users found, local authentication will not be available")
+		app.runtime.LocalUsers = []model.LocalUser{}
+	}
+
+	// load oauth whitelist
+	oauthWhitelist, err := utils.GetStringList(app.config.OAuth.Whitelist, app.config.OAuth.WhitelistFile)
+
+	if err != nil {
+		return fmt.Errorf("failed to load oauth whitelist: %w", err)
+	}
+
+	app.runtime.OAuthWhitelist = oauthWhitelist
+
+	// setup oauth providers
+	app.runtime.OAuthProviders = app.config.OAuth.Providers
+
+	for id, provider := range app.runtime.OAuthProviders {
+		if slices.Contains(model.ReservedProviderNames, id) {
+			return fmt.Errorf("provider id %s is reserved and cannot be used", id)
+		}
+
+		providerWhitelist, err := utils.GetStringList(provider.Whitelist, provider.WhitelistFile)
+		if err != nil {
+			return fmt.Errorf("failed to load oauth whitelist for provider %s: %w", id, err)
+		}
+
+		provider.Whitelist = providerWhitelist
+
+		secret := utils.GetSecret(provider.ClientSecret, provider.ClientSecretFile)
+		provider.ClientSecret = secret
+		provider.ClientSecretFile = ""
+
+		if provider.Name == "" {
+			if name, ok := model.OverrideProviders[id]; ok {
+				provider.Name = name
+			} else {
+				provider.Name = utils.Capitalize(id)
+			}
+		}
+
+		if provider.RedirectURL == "" {
+			provider.RedirectURL = app.runtime.AppURL + "/api/oauth/callback/" + id
+		}
+
+		app.runtime.OAuthProviders[id] = provider
+	}
+
+	cookieDomain, err := utils.GetCookieDomain(app.runtime.AppURL, app.config.Auth.SubdomainsEnabled)
+
+	if err != nil {
+		return fmt.Errorf("failed to get cookie domain: %w", err)
+	}
+
+	app.runtime.CookieDomain = cookieDomain
+
+	// cookie names
+	u, err := url.Parse(app.runtime.AppURL)
+
+	if err != nil {
+		return fmt.Errorf("failed to parse app url: %w", err)
+	}
+
+	app.runtime.UUID = utils.GenerateUUID(u.Hostname())
+
+	cookieId := strings.Split(app.runtime.UUID, "-")[0] // first 8 characters of the uuid should be good enough
+
+	app.runtime.SessionCookieName = fmt.Sprintf("%s-%s", model.SessionCookieName, cookieId)
+	app.runtime.OAuthSessionCookieName = fmt.Sprintf("%s-%s", model.OAuthSessionCookieName, cookieId)
+
+	return nil
 }
 
 func (app *BootstrapApp) heartbeatRoutine(ctx context.Context) {
