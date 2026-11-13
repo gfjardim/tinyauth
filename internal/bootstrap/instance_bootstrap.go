@@ -45,6 +45,21 @@ type instance struct {
 	requests sync.WaitGroup
 }
 
+// newInstance prepares an instance for the configuration and starts it
+func (app *BootstrapApp) newInstance(config model.Config) (*instance, error) {
+	inst, err := app.prepareInstance(config)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := app.startInstance(inst); err != nil {
+		return nil, err
+	}
+
+	return inst, nil
+}
+
 // prepareInstance creates an instance and derives its runtime config, which is
 // where an invalid configuration is found. It opens no connection and stores
 // nothing, so it can run before the database is set up.
