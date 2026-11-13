@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -247,6 +248,13 @@ func (app *BootstrapApp) reload() error {
 
 	if err != nil {
 		return fmt.Errorf("failed to apply configuration: %w", err)
+	}
+
+	// a label provider that cannot be reached is skipped when the app starts,
+	// but a reload must not take the labels away from a working instance
+	if config.LabelProvider != "none" && app.currentInstance().hasLabelProvider() && !inst.hasLabelProvider() {
+		inst.shutdown()
+		return errors.New("failed to apply configuration: label provider is not available")
 	}
 
 	// the instance is accepted, from here on the reload cannot fail

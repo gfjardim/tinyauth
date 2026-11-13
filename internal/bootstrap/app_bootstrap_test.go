@@ -707,6 +707,42 @@ func TestReload(t *testing.T) {
 		assert.Empty(t, consents)
 	})
 
+	t.Run("keeps the instance and the stored data when the label provider is lost", func(t *testing.T) {
+		app, config := newTestApp(t)
+		previous := app.currentInstance()
+		ctx := context.Background()
+
+		// the reload would also remove a client that has a consent stored
+		_, err := previous.services.oidcService.UpsertOIDCConsent(ctx, "testuser", "openid", "some-client-id")
+		require.NoError(t, err)
+
+		config.OIDC.Clients = map[string]model.OIDCClientConfig{
+			"other": {ClientID: "other-client-id", ClientSecret: "other-client-secret"},
+		}
+
+		// the previous instance had a label provider, the new one cannot reach
+		// it. Kubernetes without any configuration fails whatever the host runs.
+		previous.services.kubernetesService = &service.KubernetesService{}
+		config.LabelProvider = "kubernetes"
+		t.Setenv("KUBERNETES_SERVICE_HOST", "")
+		t.Setenv("KUBERNETES_SERVICE_PORT", "")
+		t.Setenv("KUBERNETES_MASTER", "")
+		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing"))
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			return config, nil
+		})
+
+		require.ErrorContains(t, app.reload(), "label provider is not available")
+
+		assert.Same(t, previous, app.currentInstance())
+		assert.NoError(t, previous.ctx.Err())
+
+		consents, err := app.queries.ListOIDCConsents(ctx)
+		require.NoError(t, err)
+		assert.Len(t, consents, 1)
+	})
+
 	t.Run("waits for the requests of the previous instance", func(t *testing.T) {
 		app, config := newTestApp(t)
 		previous := app.currentInstance()

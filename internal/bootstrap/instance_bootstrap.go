@@ -118,6 +118,10 @@ func (app *BootstrapApp) startInstance(inst *instance) error {
 	return nil
 }
 
+func (app *instance) hasLabelProvider() bool {
+	return app.services.dockerService != nil || app.services.kubernetesService != nil
+}
+
 // reconcile brings the stored data in line with the configuration of the
 // instance. An instance can still be rejected after it has been built, so this
 // is only to be called once the instance has been accepted. It runs on the
