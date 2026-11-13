@@ -27,27 +27,44 @@ type instance struct {
 	services Services
 	log      *logger.Logger
 	ctx      context.Context
+	cancel   context.CancelCauseFunc
 	queries  repository.Store
 	router   *gin.Engine
 	ding     *ding.Ding
 	dig      *dig.Container
+
+	// stops the routines in the ding, which have a context of their own
+	stopRoutines context.CancelFunc
 }
 
 // prepareInstance creates an instance and derives its runtime config, which is
 // where an invalid configuration is found. It opens no connection and stores
 // nothing, so it can run before the database is set up.
 func (app *BootstrapApp) prepareInstance(config model.Config) (*instance, error) {
+	// once it is built the instance does not follow the app context, the app
+	// shuts it down after the listener has stopped
+	detached := context.WithoutCancel(app.ctx)
+	ctx, cancel := context.WithCancelCause(detached)
+
+	// the context of the services is cancelled when the app is shut down
+	// while they are being built. The routines must not stop with it: a ding
+	// that is stopping while routines are still added to it can panic.
+	routines, stopRoutines := context.WithCancel(detached)
+
 	inst := &instance{
-		config: config,
-		log:    app.log,
-		ctx:    app.ctx,
-		ding:   app.ding,
-		dig:    dig.New(),
+		config:       config,
+		log:          app.log,
+		ctx:          ctx,
+		cancel:       cancel,
+		ding:         ding.New(routines),
+		dig:          dig.New(),
+		stopRoutines: stopRoutines,
 	}
 
 	err := inst.setupRuntime()
 
 	if err != nil {
+		inst.shutdown()
 		return nil, err
 	}
 
@@ -58,13 +75,29 @@ func (app *BootstrapApp) prepareInstance(config model.Config) (*instance, error)
 func (app *BootstrapApp) startInstance(inst *instance) error {
 	inst.queries = app.queries
 
+	// while it is being built the instance follows the app context, so that a
+	// shutdown does not have to wait for services that cannot connect
+	stop := context.AfterFunc(app.ctx, func() {
+		inst.cancel(context.Cause(app.ctx))
+	})
+
 	err := inst.setup()
 
+	stop()
+
 	if err != nil {
+		inst.shutdown()
 		return err
 	}
 
 	return nil
+}
+
+// shutdown stops the routines of the instance and waits for them to finish
+func (app *instance) shutdown() {
+	app.cancel(nil)
+	app.stopRoutines()
+	app.ding.Wait()
 }
 
 func (app *instance) setup() error {

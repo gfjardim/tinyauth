@@ -25,6 +25,9 @@ import (
 // 2. HTTP server listeners - ding.RingNormal
 // 3. Networking layers, user and label providers (e.g. ailscale service, kubernetes service) - ding.RingMajor
 // 4. Database connection - ding.RingCritical
+//
+// The routines started by the services run in the ding of their instance, which
+// follows the same order and is shut down by the app in step 3
 
 type Services struct {
 	accessControlService *service.AccessControlsService
@@ -83,6 +86,7 @@ func (app *BootstrapApp) Setup() error {
 	store, err := app.SetupStore()
 
 	if err != nil {
+		inst.shutdown()
 		return fmt.Errorf("failed to setup database: %w", err)
 	}
 
@@ -109,6 +113,12 @@ func (app *BootstrapApp) Setup() error {
 	}
 
 	app.instance = inst
+
+	app.ding.Go(func(ctx context.Context) {
+		<-ctx.Done()
+		app.log.App.Debug().Msg("Shutting down services")
+		app.instance.shutdown()
+	}, ding.RingMajor)
 
 	// start db cleanup routine
 	app.log.App.Debug().Msg("Starting database cleanup routine")
