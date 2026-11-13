@@ -13,12 +13,14 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/steveiliop56/ding"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -107,6 +109,16 @@ func allowed(app *BootstrapApp, domain string) bool {
 func startApp(t *testing.T, config model.Config, loader func() (model.Config, error)) (string, func() error) {
 	t.Helper()
 
+	return startAppWith(t, config, func(app *BootstrapApp) {
+		app.WithConfigLoader(loader)
+	})
+}
+
+// startAppWith is startApp, with the app set up by the given function
+// instead of only given the loader
+func startAppWith(t *testing.T, config model.Config, configure func(app *BootstrapApp)) (string, func() error) {
+	t.Helper()
+
 	// a SIGHUP that the app does not take must fail the test, not end the process
 	guard := make(chan os.Signal, 1)
 	signal.Notify(guard, syscall.SIGHUP)
@@ -123,7 +135,8 @@ func startApp(t *testing.T, config model.Config, loader func() (model.Config, er
 	config.Analytics.Enabled = false
 	config.Log.Level = "disabled"
 
-	app := NewBootstrapApp(config).WithConfigLoader(loader)
+	app := NewBootstrapApp(config)
+	configure(app)
 	returned := make(chan error, 1)
 
 	go func() {
@@ -1224,7 +1237,7 @@ func TestReloadRoutine(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		app.reloadRoutine(ctx, sighup)
+		app.reloadRoutine(ctx, sighup, nil)
 		close(done)
 	}()
 
@@ -1415,7 +1428,7 @@ func TestReloadOnShutdown(t *testing.T) {
 		done := make(chan struct{})
 
 		go func() {
-			app.reloadRoutine(ctx, sighup)
+			app.reloadRoutine(ctx, sighup, nil)
 			close(done)
 		}()
 
@@ -1425,6 +1438,46 @@ func TestReloadOnShutdown(t *testing.T) {
 			t.Fatal("routine did not take the signal")
 		}
 
+		stop()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not stop")
+		}
+
+		assert.Zero(t, loads)
+	})
+
+	t.Run("ignores a change of the file that arrives with the shutdown", func(t *testing.T) {
+		app, config := newTestApp(t)
+		loads := 0
+
+		app.WithConfigLoader(func() (model.Config, error) {
+			loads++
+			return config, nil
+		})
+
+		app.watchSettle = 10 * time.Millisecond
+		app.cancel()
+
+		ctx, stop := context.WithCancel(context.Background())
+		changes := make(chan struct{})
+		done := make(chan struct{})
+
+		go func() {
+			app.reloadRoutine(ctx, nil, changes)
+			close(done)
+		}()
+
+		select {
+		case changes <- struct{}{}:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not take the change")
+		}
+
+		// the file settles before the routine is stopped
+		time.Sleep(200 * time.Millisecond)
 		stop()
 
 		select {
@@ -1456,7 +1509,7 @@ func TestReloadOnShutdown(t *testing.T) {
 		done := make(chan struct{})
 
 		go func() {
-			app.reloadRoutine(ctx, sighup)
+			app.reloadRoutine(ctx, sighup, nil)
 			close(done)
 		}()
 
@@ -1504,4 +1557,542 @@ func TestRestartRequired(t *testing.T) {
 	changed = config
 	changed.Analytics.Enabled = !config.Analytics.Enabled
 	assert.True(t, app.restartRequired(changed))
+}
+
+// watchedConfig is a configuration file that holds the name of the one app
+// the configuration allows, name.example.com
+type watchedConfig struct {
+	path   string
+	config model.Config
+
+	mu sync.Mutex
+	// what each load read, an empty string for a load that failed
+	loads []string
+}
+
+func newWatchedConfig(t *testing.T, name string) *watchedConfig {
+	t.Helper()
+
+	c := &watchedConfig{
+		path:   filepath.Join(t.TempDir(), "config.yml"),
+		config: newTestConfig(t),
+	}
+
+	c.write(t, name)
+
+	return c
+}
+
+// configFor is the configuration of the file that holds the given name
+func (c *watchedConfig) configFor(name string) model.Config {
+	config := c.config
+	config.Apps = map[string]model.App{
+		name: {
+			Config: model.AppConfig{Domain: name + ".example.com"},
+			Path:   model.AppPath{Allow: "/.*"},
+		},
+	}
+	return config
+}
+
+// load is the loader of the app. A file that is empty, as one being written
+// can be, does not load.
+func (c *watchedConfig) load() (model.Config, error) {
+	content, err := os.ReadFile(c.path)
+	name := strings.TrimSpace(string(content))
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err != nil || name == "" {
+		c.loads = append(c.loads, "")
+		return model.Config{}, errors.New("invalid configuration")
+	}
+
+	c.loads = append(c.loads, name)
+
+	return c.configFor(name), nil
+}
+
+func (c *watchedConfig) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.loads)
+}
+
+func (c *watchedConfig) last() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.loads) == 0 {
+		return ""
+	}
+	return c.loads[len(c.loads)-1]
+}
+
+func (c *watchedConfig) loaded() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.loads...)
+}
+
+func (c *watchedConfig) write(t *testing.T, name string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(c.path, []byte(name+"\n"), 0600))
+}
+
+// start starts the app as the command does with a configuration file,
+// configured from what the file holds, with a short settle interval
+func (c *watchedConfig) start(t *testing.T, name string, settle time.Duration) (string, func() error) {
+	t.Helper()
+
+	return startAppWith(t, c.configFor(name), func(app *BootstrapApp) {
+		app.WithConfigLoader(c.load).WithConfigFile(c.path)
+		app.watchSettle = settle
+	})
+}
+
+// inotifyInstances counts the inotify instances that the process holds,
+// which is what a file watcher is made of on Linux
+func inotifyInstances(t *testing.T) int {
+	t.Helper()
+
+	if runtime.GOOS != "linux" {
+		t.Skip("counts the inotify instances of Linux")
+	}
+
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+
+	count := 0
+
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err == nil && target == "anon_inode:inotify" {
+			count++
+		}
+	}
+
+	return count
+}
+
+func TestWatchConfigFile(t *testing.T) {
+	const settle = 200 * time.Millisecond
+
+	t.Run("reloads when the file is written", func(t *testing.T) {
+		c := newWatchedConfig(t, "foo")
+		base, stop := c.start(t, "foo", settle)
+
+		require.True(t, allowedAt(base, "foo.example.com"))
+		require.False(t, allowedAt(base, "bar.example.com"))
+
+		c.write(t, "bar")
+
+		require.Eventually(t, func() bool {
+			return allowedAt(base, "bar.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		assert.False(t, allowedAt(base, "foo.example.com"))
+		assert.NoError(t, stop())
+	})
+
+	t.Run("reloads when the file is replaced by a rename", func(t *testing.T) {
+		c := newWatchedConfig(t, "foo")
+		base, stop := c.start(t, "foo", settle)
+
+		temporary := filepath.Join(filepath.Dir(c.path), ".config.yml.tmp")
+		require.NoError(t, os.WriteFile(temporary, []byte("bar\n"), 0600))
+		require.NoError(t, os.Rename(temporary, c.path))
+
+		require.Eventually(t, func() bool {
+			return allowedAt(base, "bar.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		assert.False(t, allowedAt(base, "foo.example.com"))
+		assert.NoError(t, stop())
+	})
+
+	t.Run("reloads a file that is removed and created again", func(t *testing.T) {
+		c := newWatchedConfig(t, "foo")
+		base, stop := c.start(t, "foo", settle)
+
+		require.NoError(t, os.Remove(c.path))
+
+		// the removal is seen and fails to load
+		require.Eventually(t, func() bool {
+			return c.count() > 0
+		}, 15*time.Second, 20*time.Millisecond, "removal was not seen")
+
+		// the file that comes back is only seen by the watch on the directory
+		time.Sleep(2 * settle)
+		c.write(t, "bar")
+
+		require.Eventually(t, func() bool {
+			return allowedAt(base, "bar.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		assert.NoError(t, stop())
+	})
+
+	t.Run("ignores the other files of its directory", func(t *testing.T) {
+		c := newWatchedConfig(t, "foo")
+		base, stop := c.start(t, "foo", settle)
+
+		dir := filepath.Dir(c.path)
+
+		// a database and the files of an editor next to the configuration
+		for i := range 20 {
+			database := filepath.Join(dir, "tinyauth.db")
+			require.NoError(t, os.WriteFile(database, fmt.Appendf(nil, "%d", i), 0600))
+			require.NoError(t, os.WriteFile(database+"-wal", fmt.Appendf(nil, "%d", i), 0600))
+			require.NoError(t, os.Chmod(database, 0640))
+
+			swap := filepath.Join(dir, ".config.yml.swp")
+			require.NoError(t, os.WriteFile(swap, []byte("bar\n"), 0600))
+			require.NoError(t, os.Rename(swap, filepath.Join(dir, "config.yml.bak")))
+			require.NoError(t, os.Remove(filepath.Join(dir, "config.yml.bak")))
+
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// longer than an event takes to reach the reload
+		time.Sleep(time.Second)
+
+		assert.Zero(t, c.count(), "a change of another file reloaded the configuration")
+		assert.True(t, allowedAt(base, "foo.example.com"))
+
+		// the watcher was there all along
+		c.write(t, "bar")
+
+		require.Eventually(t, func() bool {
+			return allowedAt(base, "bar.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		assert.NoError(t, stop())
+	})
+
+	t.Run("reloads a burst of writes once, with the last content", func(t *testing.T) {
+		c := newWatchedConfig(t, "v0")
+
+		// the writes are closer to each other than the interval, and the
+		// burst lasts more than three times as long as it
+		base, stop := c.start(t, "v0", 600*time.Millisecond)
+
+		for i := 1; i <= 25; i++ {
+			c.write(t, fmt.Sprintf("v%d", i))
+			time.Sleep(80 * time.Millisecond)
+		}
+
+		require.Eventually(t, func() bool {
+			return allowedAt(base, "v25.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		// a reload that would still come
+		time.Sleep(time.Second)
+
+		assert.Equal(t, []string{"v25"}, c.loaded())
+		assert.NoError(t, stop())
+	})
+
+	t.Run("never serves a file that is still being written", func(t *testing.T) {
+		c := newWatchedConfig(t, "foo")
+		base, stop := c.start(t, "foo", 500*time.Millisecond)
+
+		// written in place in two chunks, the first of which is a valid
+		// configuration on its own that allows another domain
+		file, err := os.OpenFile(c.path, os.O_WRONLY|os.O_TRUNC, 0600)
+		require.NoError(t, err)
+		_, err = file.WriteString("ba")
+		require.NoError(t, err)
+
+		partial := 0
+
+		probe := func(until func() bool, deadline time.Duration) {
+			end := time.Now().Add(deadline)
+			for time.Now().Before(end) && !until() {
+				if allowedAt(base, "ba.example.com") {
+					partial++
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+
+		probe(func() bool { return false }, 50*time.Millisecond)
+
+		_, err = file.WriteString("r\n")
+		require.NoError(t, err)
+		require.NoError(t, file.Close())
+
+		// through the interval, until the complete file is served
+		probe(func() bool { return allowedAt(base, "bar.example.com") }, 15*time.Second)
+
+		require.True(t, allowedAt(base, "bar.example.com"), "app did not reload")
+		assert.Zero(t, partial, "the part written first was served")
+		assert.Equal(t, []string{"bar"}, c.loaded())
+		assert.NoError(t, stop())
+	})
+
+	t.Run("reloads at once on SIGHUP while a change settles", func(t *testing.T) {
+		c := newWatchedConfig(t, "foo")
+		base, stop := c.start(t, "foo", 10*time.Second)
+
+		c.write(t, "bar")
+
+		// let the change reach the reload routine
+		time.Sleep(100 * time.Millisecond)
+
+		started := time.Now()
+		signalSelf(t, syscall.SIGHUP)
+
+		require.Eventually(t, func() bool {
+			return allowedAt(base, "bar.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		assert.Less(t, time.Since(started), 5*time.Second, "the signal waited for the file to settle")
+		assert.NoError(t, stop())
+	})
+
+	t.Run("reloads a file replaced through symlinks as in a kubernetes config map", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("a config map is mounted on Linux")
+		}
+
+		// the file is a symlink to ..data/config.yml, and ..data a symlink
+		// to the directory of the current version, which is replaced by
+		// swapping the symlink and removing the previous directory
+		dir := t.TempDir()
+
+		version := func(n int, name string) {
+			versionDir := filepath.Join(dir, fmt.Sprintf("..v%d", n))
+			require.NoError(t, os.Mkdir(versionDir, 0700))
+			require.NoError(t, os.WriteFile(filepath.Join(versionDir, "config.yml"), []byte(name+"\n"), 0600))
+			require.NoError(t, os.Symlink(filepath.Base(versionDir), filepath.Join(dir, "..data_tmp")))
+			require.NoError(t, os.Rename(filepath.Join(dir, "..data_tmp"), filepath.Join(dir, "..data")))
+
+			if n > 1 {
+				require.NoError(t, os.RemoveAll(filepath.Join(dir, fmt.Sprintf("..v%d", n-1))))
+			}
+		}
+
+		version(1, "foo")
+
+		c := &watchedConfig{path: filepath.Join(dir, "config.yml"), config: newTestConfig(t)}
+		require.NoError(t, os.Symlink(filepath.Join("..data", "config.yml"), c.path))
+
+		base, stop := c.start(t, "foo", settle)
+
+		// the second update needs the file watched again after the first
+		for n, name := range []string{"bar", "baz"} {
+			version(n+2, name)
+
+			require.Eventually(t, func() bool {
+				return allowedAt(base, name+".example.com")
+			}, 15*time.Second, 20*time.Millisecond, "app did not reload to %s", name)
+		}
+
+		assert.NoError(t, stop())
+	})
+
+	t.Run("does not watch without a configuration file", func(t *testing.T) {
+		instances := inotifyInstances(t)
+
+		c := newWatchedConfig(t, "foo")
+
+		// a configuration from flags or the environment, that the loader
+		// would read from the file all the same
+		base, stop := startAppWith(t, c.configFor("foo"), func(app *BootstrapApp) {
+			app.WithConfigLoader(c.load)
+			app.watchSettle = settle
+		})
+
+		assert.Equal(t, instances, inotifyInstances(t))
+
+		c.write(t, "bar")
+		time.Sleep(time.Second)
+
+		assert.Zero(t, c.count())
+		assert.True(t, allowedAt(base, "foo.example.com"))
+		assert.NoError(t, stop())
+	})
+
+	t.Run("does not watch without a loader", func(t *testing.T) {
+		instances := inotifyInstances(t)
+
+		c := newWatchedConfig(t, "foo")
+
+		_, stop := startAppWith(t, c.configFor("foo"), func(app *BootstrapApp) {
+			app.WithConfigFile(c.path)
+		})
+
+		assert.Equal(t, instances, inotifyInstances(t))
+		assert.NoError(t, stop())
+	})
+
+	t.Run("stops watching on shutdown", func(t *testing.T) {
+		instances := inotifyInstances(t)
+
+		c := newWatchedConfig(t, "foo")
+		_, stop := c.start(t, "foo", settle)
+
+		assert.Equal(t, instances+1, inotifyInstances(t), "the file is not watched")
+
+		require.NoError(t, stop())
+
+		// the setup has returned, the watcher is closed
+		assert.Equal(t, instances, inotifyInstances(t), "the watcher is still open")
+
+		c.write(t, "bar")
+		time.Sleep(500 * time.Millisecond)
+
+		assert.Zero(t, c.count())
+	})
+
+	t.Run("starts without the watcher when the file cannot be watched", func(t *testing.T) {
+		instances := inotifyInstances(t)
+
+		config := newTestConfig(t)
+
+		reloaded := config
+		reloaded.Apps = map[string]model.App{
+			"bar": {
+				Config: model.AppConfig{Domain: "bar.example.com"},
+				Path:   model.AppPath{Allow: "/.*"},
+			},
+		}
+
+		base, stop := startAppWith(t, config, func(app *BootstrapApp) {
+			app.WithConfigLoader(func() (model.Config, error) {
+				return reloaded, nil
+			})
+			app.WithConfigFile(filepath.Join(t.TempDir(), "missing", "config.yml"))
+		})
+
+		// the watcher that could not watch is not left open
+		assert.Equal(t, instances, inotifyInstances(t))
+
+		// and the signal still reloads
+		signalSelf(t, syscall.SIGHUP)
+
+		require.Eventually(t, func() bool {
+			return allowedAt(base, "bar.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		assert.NoError(t, stop())
+	})
+}
+
+// watchApp is the app of newTestApp with the routines that watch and reload
+// the given configuration file, and what it logs
+func watchApp(t *testing.T, c *watchedConfig, settle time.Duration) (*BootstrapApp, *syncBuffer) {
+	t.Helper()
+
+	app, _ := newTestApp(t)
+
+	output := &syncBuffer{}
+	log := logger.NewLogger().WithTestConfig().WithWriter(output)
+	log.Init()
+	app.log = log
+
+	app.WithConfigLoader(c.load).WithConfigFile(c.path)
+	app.watchSettle = settle
+
+	watcher, err := app.watchConfigFile()
+	require.NoError(t, err)
+
+	changes := make(chan struct{}, 1)
+
+	app.ding.Go(func(ctx context.Context) {
+		app.watchRoutine(ctx, watcher, changes)
+	}, ding.RingMinor)
+
+	app.ding.Go(func(ctx context.Context) {
+		app.reloadRoutine(ctx, nil, changes)
+	}, ding.RingMinor)
+
+	return app, output
+}
+
+func TestWatchRoutine(t *testing.T) {
+	t.Run("applies a file saved in place once and without an error", func(t *testing.T) {
+		c := newWatchedConfig(t, "foo")
+		app, output := watchApp(t, c, 300*time.Millisecond)
+
+		// as a shell redirection does: truncated, then written
+		file, err := os.OpenFile(c.path, os.O_WRONLY|os.O_TRUNC, 0600)
+		require.NoError(t, err)
+		time.Sleep(20 * time.Millisecond)
+		_, err = file.WriteString("bar\n")
+		require.NoError(t, err)
+		require.NoError(t, file.Close())
+
+		require.Eventually(t, func() bool {
+			return allowed(app, "bar.example.com")
+		}, 15*time.Second, 20*time.Millisecond, "app did not reload")
+
+		// a reload that would still come
+		time.Sleep(time.Second)
+
+		assert.Equal(t, []string{"bar"}, c.loaded())
+		assert.NotContains(t, output.String(), "Failed to reload")
+		assert.Equal(t, 1, strings.Count(output.String(), "Configuration reloaded"))
+	})
+
+	t.Run("reports lost events as a change", func(t *testing.T) {
+		app, _ := newTestApp(t)
+		app.WithConfigFile(filepath.Join(t.TempDir(), "config.yml"))
+		require.NoError(t, os.WriteFile(app.configFile, []byte("foo\n"), 0600))
+
+		watcher, err := app.watchConfigFile()
+		require.NoError(t, err)
+
+		ctx, stop := context.WithCancel(context.Background())
+		changes := make(chan struct{}, 1)
+		done := make(chan struct{})
+
+		go func() {
+			app.watchRoutine(ctx, watcher, changes)
+			close(done)
+		}()
+
+		// what the watcher reports when the queue of the kernel overflowed
+		select {
+		case watcher.Errors <- fsnotify.ErrEventOverflow:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not take the error")
+		}
+
+		select {
+		case <-changes:
+		case <-time.After(5 * time.Second):
+			t.Error("lost events were not reported as a change")
+		}
+
+		stop()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("routine did not stop")
+		}
+	})
+
+	for _, move := range []string{"removed", "renamed"} {
+		t.Run("warns when the directory is "+move, func(t *testing.T) {
+			parent := t.TempDir()
+			c := &watchedConfig{path: filepath.Join(parent, "config", "config.yml"), config: newTestConfig(t)}
+			require.NoError(t, os.Mkdir(filepath.Dir(c.path), 0700))
+			c.write(t, "foo")
+
+			_, output := watchApp(t, c, 50*time.Millisecond)
+
+			if move == "removed" {
+				require.NoError(t, os.RemoveAll(filepath.Dir(c.path)))
+			} else {
+				require.NoError(t, os.Rename(filepath.Dir(c.path), filepath.Join(parent, "moved")))
+			}
+
+			require.Eventually(t, func() bool {
+				return strings.Contains(output.String(), "only reloaded on SIGHUP")
+			}, 5*time.Second, 20*time.Millisecond, "no warning was logged")
+		})
+	}
 }

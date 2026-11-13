@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/steveiliop56/ding"
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
@@ -65,12 +67,20 @@ type BootstrapApp struct {
 
 	// loads the configuration again from its sources, nil disables reloading
 	configLoader func() (model.Config, error)
+
+	// the configuration file the loader reads, empty when there is none
+	configFile string
+
+	// how long the configuration file must be left unchanged after a change
+	// before it is reloaded
+	watchSettle time.Duration
 }
 
 func NewBootstrapApp(config model.Config) *BootstrapApp {
 	return &BootstrapApp{
 		config:       config,
 		drainTimeout: model.GracefulShutdownTimeout * time.Second,
+		watchSettle:  2 * time.Second,
 	}
 }
 
@@ -78,6 +88,14 @@ func NewBootstrapApp(config model.Config) *BootstrapApp {
 // returned by the given loader
 func (app *BootstrapApp) WithConfigLoader(loader func() (model.Config, error)) *BootstrapApp {
 	app.configLoader = loader
+	return app
+}
+
+// WithConfigFile names the configuration file that the loader reads. With a
+// loader, the configuration is also reloaded when this file changes. An empty
+// path, the app configured without a file, watches nothing.
+func (app *BootstrapApp) WithConfigFile(path string) *BootstrapApp {
+	app.configFile = path
 	return app
 }
 
@@ -108,6 +126,25 @@ func (app *BootstrapApp) Setup() error {
 	app.log = log
 
 	app.log.App.Info().Msgf("Starting Tinyauth version: %s", model.Version)
+
+	// watch the configuration file from here on, so that a change made while
+	// the app starts is kept for the reload routine, as a signal is. The
+	// events wait in the watcher until the routine that reads them starts.
+	var watcher *fsnotify.Watcher
+
+	if app.configLoader != nil && app.configFile != "" {
+		w, err := app.watchConfigFile()
+
+		if err != nil {
+			// the app does not need the watcher to run, as before it existed
+			app.log.App.Warn().Err(err).Str("file", app.configFile).Msg("Failed to watch the configuration file, it is only reloaded on SIGHUP")
+		} else {
+			// the routine closes it with the app, this covers the returns
+			// before the routine is started
+			watcher = w
+			defer watcher.Close()
+		}
+	}
 
 	// an invalid configuration is found here, before anything is created
 	inst, err := app.prepareInstance(app.config)
@@ -169,10 +206,20 @@ func (app *BootstrapApp) Setup() error {
 		app.ding.Go(app.heartbeatRoutine, ding.RingMinor)
 	}
 
-	// reload the configuration on SIGHUP
+	// reload the configuration on SIGHUP and when the file changes
 	if app.configLoader != nil {
+		var changes chan struct{}
+
+		if watcher != nil {
+			changes = make(chan struct{}, 1)
+
+			app.ding.Go(func(ctx context.Context) {
+				app.watchRoutine(ctx, watcher, changes)
+			}, ding.RingMinor)
+		}
+
 		app.ding.Go(func(ctx context.Context) {
-			app.reloadRoutine(ctx, sighup)
+			app.reloadRoutine(ctx, sighup, changes)
 		}, ding.RingMinor)
 	}
 
@@ -342,33 +389,155 @@ func (app *BootstrapApp) retire(inst *instance) {
 	}, ding.RingMajor)
 }
 
-func (app *BootstrapApp) reloadRoutine(ctx context.Context, sighup <-chan os.Signal) {
+// reloadRoutine reloads the configuration, one reload at a time, on SIGHUP
+// and when the watch routine reports a change of the configuration file.
+//
+// A SIGHUP reloads at once. A change of the file only reloads once the file
+// has been left unchanged for the settle interval: every further change
+// starts the interval again. A file is written in several steps, and the
+// part written first can be a valid configuration that grants more than the
+// complete one; reloading on the first change, as Traefik does, would apply
+// it until the next reload. A writer that pauses for longer than the
+// interval in the middle of the file still gets the part written so far
+// applied if it is valid, which is why a file should be replaced atomically.
+//
+// A file that keeps changing for longer than the interval is not reloaded
+// until it settles. There is no cap: a cap would reload a file that is still
+// being written, the very thing the interval is there to avoid.
+//
+// No change is lost: one that arrives during a reload waits in the channel,
+// starts the interval when the reload is over and is followed by a reload of
+// the file as it is then.
+func (app *BootstrapApp) reloadRoutine(ctx context.Context, sighup <-chan os.Signal, changes <-chan struct{}) {
+	// fires when the file has settled, nil when no change is waiting
+	var settled <-chan time.Time
+
 	for {
 		select {
 		case <-sighup:
-			// a signal that arrives with the shutdown. The context of the
-			// app is looked at because the one of the routine is only
-			// cancelled a moment later.
-			if app.ctx.Err() != nil {
-				continue
-			}
-
-			app.log.App.Info().Msg("Received SIGHUP, reloading configuration")
-
-			if err := app.reload(); err != nil {
-				// a reload that the shutdown interrupted was not refused
-				if app.ctx.Err() != nil {
-					app.log.App.Debug().Err(err).Msg("Configuration reload interrupted by the shutdown")
-					continue
-				}
-
-				app.log.App.Error().Err(err).Msg("Failed to reload configuration, keeping the previous one")
-				continue
-			}
-
-			app.log.App.Info().Msg("Configuration reloaded")
+			app.reloadOn("Received SIGHUP, reloading configuration")
+		case <-changes:
+			settled = time.After(app.watchSettle)
+		case <-settled:
+			settled = nil
+			app.reloadOn("Configuration file changed, reloading configuration")
 		case <-ctx.Done():
 			app.log.App.Debug().Msg("Stopping configuration reload routine")
+			return
+		}
+	}
+}
+
+// reloadOn reloads the configuration for the reason given, unless the app is
+// shutting down
+func (app *BootstrapApp) reloadOn(reason string) {
+	// a signal or a change that arrives with the shutdown. The context of the
+	// app is looked at because the one of the routine is only cancelled a
+	// moment later.
+	if app.ctx.Err() != nil {
+		return
+	}
+
+	app.log.App.Info().Msg(reason)
+
+	if err := app.reload(); err != nil {
+		// a reload that the shutdown interrupted was not refused
+		if app.ctx.Err() != nil {
+			app.log.App.Debug().Err(err).Msg("Configuration reload interrupted by the shutdown")
+			return
+		}
+
+		app.log.App.Error().Err(err).Msg("Failed to reload configuration, keeping the previous one")
+		return
+	}
+
+	app.log.App.Info().Msg("Configuration reloaded")
+}
+
+// watchConfigFile watches the configuration file for changes. As the file
+// provider of Traefik does, it watches the directory of the file, which sees
+// the file replaced by a rename, and the file itself, which sees a file
+// changed through another path, such as a mount or a symlink.
+func (app *BootstrapApp) watchConfigFile() (*fsnotify.Watcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create watcher: %w", err)
+	}
+
+	for _, path := range []string{filepath.Dir(app.configFile), app.configFile} {
+		if err := watcher.Add(path); err != nil {
+			watcher.Close()
+			return nil, fmt.Errorf("failed to watch %s: %w", path, err)
+		}
+	}
+
+	return watcher, nil
+}
+
+// watchRoutine reports the changes of the configuration file to the reload
+// routine, through a channel that holds one change and drops the others
+// until it is read. It stops with the app and closes the watcher.
+func (app *BootstrapApp) watchRoutine(ctx context.Context, watcher *fsnotify.Watcher, changes chan<- struct{}) {
+	defer watcher.Close()
+
+	// the directory holds other files, often written, such as the database.
+	// Only the events about the configuration file count.
+	name := filepath.Base(app.configFile)
+	dir := filepath.Clean(filepath.Dir(app.configFile))
+
+	changed := func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	}
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+
+			// the watches end with the directory, a directory created again
+			// in its place is not seen
+			if filepath.Clean(event.Name) == dir && (event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)) {
+				app.log.App.Warn().Str("directory", dir).Msg("The directory of the configuration file was removed or renamed, from now on the file is only reloaded on SIGHUP")
+				continue
+			}
+
+			if filepath.Base(event.Name) != name {
+				continue
+			}
+
+			app.log.App.Debug().Str("event", event.Op.String()).Msg("Configuration file changed")
+
+			// the watch on the file ends when the file is replaced, removed
+			// or, through a symlink such as the one of a kubernetes config
+			// map, unlinked. Watching it again follows the file that has
+			// taken its place, if there is one already; otherwise the watch
+			// on the directory sees it arrive.
+			if !event.Has(fsnotify.Write) {
+				if err := watcher.Add(app.configFile); err != nil {
+					app.log.App.Debug().Err(err).Msg("Failed to watch the configuration file again")
+				}
+			}
+
+			changed()
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+
+			// events were lost, among them maybe a change of the file
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				changed()
+			}
+
+			app.log.App.Warn().Err(err).Msg("Error while watching the configuration file")
+		case <-ctx.Done():
+			app.log.App.Debug().Msg("Stopping configuration file watcher")
 			return
 		}
 	}

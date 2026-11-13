@@ -76,3 +76,29 @@ func TestLoadConfig(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+func TestConfigFilePath(t *testing.T) {
+	t.Run("returns the file given by the flag", func(t *testing.T) {
+		t.Setenv("TINYAUTH_CONFIGFILE", "/env/config.yml")
+
+		path, err := configFilePath([]string{"--configfile=/flag/config.yml"}, model.NewDefaultConfiguration(model.DetectRuntimeEnv()))
+		require.NoError(t, err)
+		assert.Equal(t, "/flag/config.yml", path)
+	})
+
+	t.Run("returns the file given by the environment", func(t *testing.T) {
+		t.Setenv("TINYAUTH_CONFIGFILE", "/env/config.yml")
+
+		path, err := configFilePath([]string{"--appurl=https://tinyauth.example.com"}, model.NewDefaultConfiguration(model.DetectRuntimeEnv()))
+		require.NoError(t, err)
+		assert.Equal(t, "/env/config.yml", path)
+	})
+
+	t.Run("returns nothing for a configuration without a file", func(t *testing.T) {
+		t.Setenv("TINYAUTH_CONFIGFILE", "")
+
+		path, err := configFilePath([]string{"--appurl=https://tinyauth.example.com"}, model.NewDefaultConfiguration(model.DetectRuntimeEnv()))
+		require.NoError(t, err)
+		assert.Empty(t, path)
+	})
+}

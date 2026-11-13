@@ -39,7 +39,12 @@ func main() {
 			for _, warn := range res.Warnings {
 				fmt.Println(colors.yellow.Render("⚠") + " " + warn)
 			}
-			return runCmd(*tConfig, func() (model.Config, error) {
+			// the file the configuration was loaded from, if any, is watched
+			configFile, err := configFilePath(args, tConfig)
+			if err != nil {
+				return err
+			}
+			return runCmd(*tConfig, configFile, func() (model.Config, error) {
 				return loadConfig(args, loaders)
 			})
 		},
@@ -172,8 +177,16 @@ func loadConfig(args []string, resources []cli.ResourceLoader) (model.Config, er
 	return *cfg, nil
 }
 
-func runCmd(cfg model.Config, configLoader func() (model.Config, error)) error {
-	app := bootstrap.NewBootstrapApp(cfg).WithConfigLoader(configLoader)
+// configFilePath returns the path of the configuration file that the file
+// loader reads, or an empty string when the configuration is not loaded from
+// a file
+func configFilePath(args []string, cfg *model.Config) (string, error) {
+	path, _, err := loaders.ConfigFile(args, cfg)
+	return path, err
+}
+
+func runCmd(cfg model.Config, configFile string, configLoader func() (model.Config, error)) error {
+	app := bootstrap.NewBootstrapApp(cfg).WithConfigLoader(configLoader).WithConfigFile(configFile)
 
 	err := app.Setup()
 
