@@ -8,7 +8,7 @@ import (
 	"go.uber.org/dig"
 )
 
-func (app *BootstrapApp) setupServices() error {
+func (app *instance) setupServices() error {
 	err := app.setupPolicyEngine()
 
 	if err != nil {
@@ -69,7 +69,7 @@ func (app *BootstrapApp) setupServices() error {
 	return nil
 }
 
-func (app *BootstrapApp) getLabelProvider() (service.LabelProvider, error) {
+func (app *instance) getLabelProvider() (service.LabelProvider, error) {
 	switch app.config.LabelProvider {
 	case "none", "docker", "kubernetes", "auto":
 		if app.config.LabelProvider == "none" {
@@ -143,7 +143,7 @@ func (app *BootstrapApp) getLabelProvider() (service.LabelProvider, error) {
 	}
 }
 
-func (app *BootstrapApp) setupPolicyEngine() error {
+func (app *instance) setupPolicyEngine() error {
 	err := app.dig.Provide(service.NewPolicyEngine)
 
 	if err != nil {

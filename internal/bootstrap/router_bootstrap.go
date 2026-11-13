@@ -17,7 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func (app *BootstrapApp) setupRouter() error {
+func (app *instance) setupRouter() error {
 	// we don't want gin debug mode
 	gin.SetMode(gin.ReleaseMode)
 
@@ -159,7 +159,7 @@ func (app *BootstrapApp) serveHTTP(ctx context.Context) error {
 
 	server := &http.Server{
 		Addr:    address,
-		Handler: app.router.Handler(),
+		Handler: app.instance.router.Handler(),
 	}
 
 	return app.serve(listener, server, ctx, "http")
@@ -186,7 +186,7 @@ func (app *BootstrapApp) serveUnix(ctx context.Context) error {
 	}
 
 	server := &http.Server{
-		Handler: app.router.Handler(),
+		Handler: app.instance.router.Handler(),
 	}
 
 	return app.serve(listener, server, ctx, "unix socket")
