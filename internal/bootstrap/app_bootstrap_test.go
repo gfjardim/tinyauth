@@ -912,3 +912,30 @@ func TestReloadOnShutdown(t *testing.T) {
 		}
 	})
 }
+
+func TestRestartRequired(t *testing.T) {
+	app, config := newTestApp(t)
+
+	assert.False(t, app.restartRequired(config))
+
+	changed := config
+	changed.Apps = nil
+	changed.Auth.LoginMaxRetries = 10
+	assert.False(t, app.restartRequired(changed))
+
+	changed = config
+	changed.Server.Port = 8080
+	assert.True(t, app.restartRequired(changed))
+
+	changed = config
+	changed.Database.Path = "/other.db"
+	assert.True(t, app.restartRequired(changed))
+
+	changed = config
+	changed.Log.Level = "debug"
+	assert.True(t, app.restartRequired(changed))
+
+	changed = config
+	changed.Analytics.Enabled = !config.Analytics.Enabled
+	assert.True(t, app.restartRequired(changed))
+}

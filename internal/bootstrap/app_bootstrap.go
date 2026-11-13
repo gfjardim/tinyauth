@@ -254,7 +254,20 @@ func (app *BootstrapApp) reload() error {
 	inst.reconcile(app.ctx)
 	app.retire(previous)
 
+	if app.restartRequired(config) {
+		app.log.App.Warn().Msg("Changes to the server, database, log and analytics configuration are only applied on restart")
+	}
+
 	return nil
+}
+
+// restartRequired reports whether the given configuration changes something
+// that is only set up once, when the app starts
+func (app *BootstrapApp) restartRequired(config model.Config) bool {
+	return config.Server != app.config.Server ||
+		config.Database != app.config.Database ||
+		config.Log != app.config.Log ||
+		config.Analytics != app.config.Analytics
 }
 
 // retire shuts an instance down once it has served the requests it already had
