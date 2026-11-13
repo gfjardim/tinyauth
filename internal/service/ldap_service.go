@@ -91,6 +91,7 @@ func NewLdapService(i LdapServiceInput) (*LdapService, error) {
 	if err != nil {
 		// 3s + 4.5s (3x1.5) = ~6.75-8.25s total wait time before giving up
 		err = ldap.reconnect(3 * time.Second)
+		ldap.close()
 		return nil, fmt.Errorf("failed to connect to ldap server: %w", err)
 	}
 
@@ -114,12 +115,35 @@ func NewLdapService(i LdapServiceInput) (*LdapService, error) {
 				}
 			case <-ctx.Done():
 				ldap.log.App.Debug().Msg("LDAP service context cancelled, stopping heartbeat")
+				ldap.close()
 				return
 			}
 		}
 	}, ding.RingMajor)
 
 	return ldap, nil
+}
+
+// close closes the connection without waiting for a request that is holding
+// it, in that case the connection is closed as soon as the request returns
+func (ldap *LdapService) close() {
+	closeConn := func() {
+		defer ldap.mutex.Unlock()
+
+		if ldap.conn != nil {
+			ldap.conn.Close()
+		}
+	}
+
+	if ldap.mutex.TryLock() {
+		closeConn()
+		return
+	}
+
+	go func() {
+		ldap.mutex.Lock()
+		closeConn()
+	}()
 }
 
 func (ldap *LdapService) connect() (*ldapgo.Conn, error) {
