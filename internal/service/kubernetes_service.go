@@ -12,6 +12,7 @@ import (
 	"github.com/tinyauthapp/tinyauth/pkg/apis/tinyauth/v1alpha1"
 	"go.uber.org/dig"
 	networking "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -123,6 +124,13 @@ type KubernetesService struct {
 	typedClient kubernetes.Interface
 	mu          sync.RWMutex
 	connected   bool
+
+	// first listing of the supported resources: how many are still to come, the
+	// error of one that failed, and the channel closed when all are over.
+	// The first two are guarded by mu.
+	pending int
+	syncErr error
+	synced  chan struct{}
 }
 
 type KubernetesServiceInput struct {
@@ -135,9 +143,10 @@ type KubernetesServiceInput struct {
 
 func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) {
 	service := &KubernetesService{
-		log:  i.Log,
-		apps: make(map[ResourceMeta]map[string]model.App),
-		ctx:  i.Ctx,
+		log:    i.Log,
+		apps:   make(map[ResourceMeta]map[string]model.App),
+		ctx:    i.Ctx,
+		synced: make(chan struct{}),
 	}
 
 	cfg, err := service.getConfig()
@@ -158,6 +167,11 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 	service.client = client
 	service.typedClient = typedClient
 
+	// every supported resource reports once: a watched one when its first
+	// listing is over, one that is skipped right away. The count is set
+	// before the first watcher starts, so it is complete when one reports.
+	service.pending = len(supportedResources)
+
 	watchedGVRs := make(map[string]bool)
 
 	for _, res := range supportedResources {
@@ -168,6 +182,16 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 		if err != nil {
 			// The CRD may not be available yet, so we'll fall back to ingress
 			i.Log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Failed to access resource, skipping watcher")
+
+			// a resource that the cluster does not have, or that the app may
+			// not read, has no labels to load. Any other failure is kept for
+			// whoever waits for the labels, which would otherwise take the
+			// labels for loaded while this resource is not even watched.
+			if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+				err = nil
+			}
+
+			service.firstListingDone(err)
 			continue
 		}
 
@@ -367,7 +391,11 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 	resyncTicker := time.NewTicker(5 * time.Minute)
 	defer resyncTicker.Stop()
 
-	if err := k.resyncGVR(res, ctx); err != nil {
+	err := k.resyncGVR(res, ctx)
+
+	k.firstListingDone(err)
+
+	if err != nil {
 		k.log.App.Warn().Err(err).Str("res", res.pretty()).Msg("Initial resync failed, will retry")
 		k.wait(ctx, 30*time.Second)
 	}
@@ -398,6 +426,39 @@ func (k *KubernetesService) watchGVR(res watchedResource, ctx context.Context) {
 			cancel()
 		}
 	}
+}
+
+// firstListingDone records how the first listing of a supported resource
+// went. A resource that is not watched is recorded without being listed.
+func (k *KubernetesService) firstListingDone(err error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	if err != nil && k.syncErr == nil {
+		k.syncErr = err
+	}
+
+	k.pending--
+
+	if k.pending == 0 {
+		close(k.synced)
+	}
+}
+
+// WaitForSync waits until every watched resource has been listed once, which
+// is when the labels of the cluster are known, and returns the error of a
+// listing that failed or of a resource that could not be probed
+func (k *KubernetesService) WaitForSync(ctx context.Context) error {
+	select {
+	case <-k.synced:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	return k.syncErr
 }
 
 func (k *KubernetesService) Lookup(locator func(name string, app *model.App)) error {

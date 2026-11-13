@@ -33,6 +33,9 @@ func newKubernetesServiceForTest() *KubernetesService {
 		apps:        make(map[ResourceMeta]map[string]model.App),
 		log:         kubernetesTestLogger(),
 		typedClient: clientfake.NewClientset(),
+		// one resource is watched
+		pending: 1,
+		synced:  make(chan struct{}),
 	}
 }
 
@@ -301,6 +304,53 @@ func TestKubernetesServiceWatchGVRStopsWhileWaiting(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestKubernetesServiceWaitForSync(t *testing.T) {
+	res := testResource(ResourceTypeIngress)
+	kinds := map[schema.GroupVersionResource]string{res.gvr: "IngressList"}
+
+	t.Run("returns once the resources were listed", func(t *testing.T) {
+		service := newKubernetesServiceForTest()
+		key := ResourceMeta{Typ: res.typ, Name: "route", Namespace: "default"}
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "networking.k8s.io/v1",
+			"kind":       "Ingress",
+			"metadata":   map[string]any{"name": "route", "namespace": "default", "annotations": map[string]any{"tinyauth.apps.app.users.allow": "alice"}},
+			"spec":       map[string]any{"rules": []any{map[string]any{"host": "app.example.com"}}},
+		}}
+		service.client = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), kinds, obj)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go service.watchGVR(res, ctx)
+
+		require.NoError(t, service.WaitForSync(ctx))
+		service.mu.RLock()
+		defer service.mu.RUnlock()
+		assert.Equal(t, "alice", service.apps[key]["app"].Users.Allow)
+	})
+
+	t.Run("returns the error of a listing that failed", func(t *testing.T) {
+		service := newKubernetesServiceForTest()
+		client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), kinds)
+		client.PrependReactor("list", "ingresses", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("list failed")
+		})
+		service.client = client
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go service.watchGVR(res, ctx)
+
+		assert.ErrorContains(t, service.WaitForSync(ctx), "list failed")
+	})
+
+	t.Run("gives up when the context is cancelled", func(t *testing.T) {
+		service := newKubernetesServiceForTest()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		assert.ErrorIs(t, service.WaitForSync(ctx), context.Canceled)
+	})
 }
 
 func TestKubernetesServiceLookup(t *testing.T) {
