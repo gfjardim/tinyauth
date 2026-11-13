@@ -57,6 +57,20 @@ type LoginAttempt struct {
 	LockedUntil    time.Time
 }
 
+// AuthCaches holds the in-memory state of the auth service that can outlive
+// it, such as when the service is rebuilt from a new configuration
+type AuthCaches struct {
+	Login *cache.CacheStore[LoginAttempt]
+	OAuth *cache.CacheStore[OAuthPendingSession]
+}
+
+func NewAuthCaches() *AuthCaches {
+	return &AuthCaches{
+		Login: cache.NewCacheStore[LoginAttempt](0),
+		OAuth: cache.NewCacheStore[OAuthPendingSession](256),
+	}
+}
+
 type AuthService struct {
 	log     *logger.Logger
 	config  *model.Config
@@ -91,6 +105,7 @@ type AuthServiceInput struct {
 	OAuthBroker  *OAuthBrokerService
 	Tailscale    *TailscaleService `optional:"true"`
 	PolicyEngine *PolicyEngine
+	Caches       *AuthCaches `optional:"true"`
 }
 
 func NewAuthService(i AuthServiceInput) (*AuthService, error) {
@@ -116,12 +131,21 @@ func NewAuthService(i AuthServiceInput) (*AuthService, error) {
 	service.dummyHash = string(dummyHash)
 
 	// caches setup
-	oauthCache := cache.NewCacheStore[OAuthPendingSession](256)
-	loginCache := cache.NewCacheStore[LoginAttempt](service.calculateLockdownLimit())
+	caches := i.Caches
+
+	if caches == nil {
+		caches = NewAuthCaches()
+	}
+
+	// Only grow a cache that is already in use, the service may still be
+	// discarded and shrinking evicts entries. The routine below adjusts it later.
+	if limit := service.calculateLockdownLimit(); limit > caches.Login.GetMaxSize() {
+		caches.Login.SetMaxSize(limit)
+	}
 	ldapCache := cache.NewCacheStore[[]string](1024)
 
-	service.caches.oauth = oauthCache
-	service.caches.login = loginCache
+	service.caches.oauth = caches.OAuth
+	service.caches.login = caches.Login
 	service.caches.ldap = ldapCache
 
 	i.Ding.Go(func(ctx context.Context) {
