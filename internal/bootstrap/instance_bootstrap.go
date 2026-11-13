@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/steveiliop56/ding"
@@ -35,6 +36,9 @@ type instance struct {
 
 	// stops the routines in the ding, which have a context of their own
 	stopRoutines context.CancelFunc
+
+	// requests being served by this instance
+	requests sync.WaitGroup
 }
 
 // prepareInstance creates an instance and derives its runtime config, which is

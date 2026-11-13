@@ -61,12 +61,12 @@ func newTestApp(t *testing.T) (*BootstrapApp, model.Config) {
 	require.NoError(t, err)
 	require.NoError(t, app.startInstance(inst))
 
-	app.instance = inst
+	app.setInstance(inst)
 
 	t.Cleanup(func() {
 		cancel()
 		app.ding.Wait()
-		app.instance.shutdown()
+		app.currentInstance().shutdown()
 	})
 
 	return app, config
@@ -193,7 +193,7 @@ func TestNewInstance(t *testing.T) {
 
 	t.Run("does not follow the context of the app once it is built", func(t *testing.T) {
 		app, _ := newTestApp(t)
-		inst := app.instance
+		inst := app.currentInstance()
 
 		// a routine of the instance, as its services start them
 		ended := make(chan struct{})
